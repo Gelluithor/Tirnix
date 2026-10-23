@@ -10,7 +10,7 @@
 <p align="center">
   <a href="https://github.com/Gelluithor/Tirnix/actions/workflows/ci.yml"><img src="https://github.com/Gelluithor/Tirnix/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/platform-Linux-informational" alt="Linux">
-  <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License">
+  <img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later">
 </p>
 
 <p align="center">
@@ -354,5 +354,11 @@ pull request. The code layout is described in
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
-at your option.
+Tirnix is free software: you can redistribute it and/or modify it under the
+terms of the [GNU General Public License](LICENSE) as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version (`GPL-3.0-or-later`).
+
+Tirnix is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the [LICENSE](LICENSE) file for details.

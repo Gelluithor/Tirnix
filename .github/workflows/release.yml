@@ -40,7 +40,7 @@ jobs:
           set -eux
           name="tirnix-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/tirnix" install.sh uninstall.sh README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cp "target/${{ matrix.target }}/release/tirnix" install.sh uninstall.sh README.md CHANGELOG.md LICENSE "dist/$name/"
           cp -r contrib "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -r "dist/$name"

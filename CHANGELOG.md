@@ -62,6 +62,11 @@ attached below for x86_64 and aarch64. Nothing is enabled or started on
 installation; optional, hardened systemd units are included for running the
 logger at boot.
 
+### License
+
+Tirnix is free software licensed under the GNU General Public License,
+version 3 or (at your option) any later version (`GPL-3.0-or-later`).
+
 ### Known limitations
 
 - Linux only. Pressure stall information needs kernel 4.20+ (with PSI

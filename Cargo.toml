@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Lightweight Linux system monitoring and diagnostics TUI"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 repository = "https://github.com/Gelluithor/Tirnix"
 readme = "README.md"
 keywords = ["monitoring", "tui", "linux", "sysadmin", "diagnostics"]
@@ -39,6 +39,7 @@ assets = [
     ["target/release/tirnix", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/tirnix/", "644"],
     ["CHANGELOG.md", "usr/share/doc/tirnix/", "644"],
+    ["LICENSE", "usr/share/doc/tirnix/", "644"],
     ["contrib/systemd/tirnix-logger.service", "usr/lib/systemd/system/", "644"],
     ["contrib/systemd/tirnix-logger-user.service", "usr/lib/systemd/user/tirnix-logger.service", "644"],
     ["contrib/config/system-config.toml", "usr/share/doc/tirnix/examples/config.toml", "644"],
@@ -53,6 +54,7 @@ assets = [
     { source = "target/release/tirnix", dest = "/usr/bin/tirnix", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/tirnix/README.md", mode = "644", doc = true },
     { source = "CHANGELOG.md", dest = "/usr/share/doc/tirnix/CHANGELOG.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/tirnix/LICENSE", mode = "644" },
     { source = "contrib/systemd/tirnix-logger.service", dest = "/usr/lib/systemd/system/tirnix-logger.service", mode = "644" },
     { source = "contrib/systemd/tirnix-logger-user.service", dest = "/usr/lib/systemd/user/tirnix-logger.service", mode = "644" },
     { source = "contrib/config/system-config.toml", dest = "/usr/share/doc/tirnix/examples/config.toml", mode = "644", doc = true },
