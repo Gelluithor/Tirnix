@@ -73,6 +73,8 @@ jobs:
           v="${GITHUB_REF_NAME#v}"
           awk -v v="$v" '/^## \[/{p = index($0, "[" v "]") > 0; next} p' CHANGELOG.md > notes.md
           test -s notes.md || echo "Release $GITHUB_REF_NAME" > notes.md
+          python3 .github/scripts/unwrap-notes.py notes.md > notes.unwrapped.md
+          mv notes.unwrapped.md notes.md
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
