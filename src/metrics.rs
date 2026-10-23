@@ -89,6 +89,35 @@ pub struct FsStats {
     pub inodes_total: u64,
     pub inodes_free: u64,
     pub readonly: bool,
+    /// Device id (`st_dev`) of the mount point, to match open files.
+    pub dev: u64,
+}
+
+/// A file held open by a process (see `collect::files`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenFile {
+    pub pid: u32,
+    pub comm: String,
+    pub path: String,
+    pub size: u64,
+    /// Device id of the filesystem the file lives on.
+    pub dev: u64,
+    /// Opened for writing.
+    pub writing: bool,
+}
+
+/// Open files that explain disk usage. Collected only while a filesystem
+/// is nearly full or disk I/O is high.
+#[derive(Debug, Clone, Default)]
+pub struct FileDiag {
+    /// Deleted files still held open (their space is not freed yet).
+    pub deleted: Vec<OpenFile>,
+    /// Files opened for writing by the processes writing the most.
+    pub written: Vec<OpenFile>,
+    /// Some processes could not be inspected (permissions).
+    pub hidden: bool,
+    /// Seconds since the scan, `None` if no scan was made.
+    pub age: Option<f64>,
 }
 
 impl FsStats {
@@ -160,6 +189,9 @@ pub struct ProcInfo {
     pub threads: u64,
     pub read_bps: Option<f64>,
     pub write_bps: Option<f64>,
+    /// Kernel function a process in state `D` is waiting in
+    /// (`/proc/<pid>/wchan`), when the kernel reveals it.
+    pub wchan: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -406,6 +438,7 @@ pub struct Snapshot {
     /// (allocated, max) file handles system-wide.
     pub file_handles: Option<(u64, u64)>,
     pub net_diag: NetDiag,
+    pub files: FileDiag,
 }
 
 impl Snapshot {

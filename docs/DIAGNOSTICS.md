@@ -35,9 +35,10 @@ findings. Each finding has three clearly separated parts:
 | Sustained swap activity | warning | swap in/out ≥ 100 pages/s with enough available memory |
 | Tasks stall on memory although RAM is available | warning | memory PSI ≥ 10 % (sustained) – typically a cgroup limit |
 | Swap is in use but idle | info | > 25 % of swap used, no swap traffic |
+| *process* keeps growing: +X in Y | info / warning | RSS of a process (≥ 64 MiB) rose steadily for ≥ 10 min by ≥ 256 MiB and ≥ 25 %; warning when < 20 % of memory is available |
 | OOM killer terminated processes | critical | `oom_kill` counter increased since Tirnix started |
 | OOM kills earlier since boot | info | `oom_kill` > 0 at start |
-| Filesystem is X % full | warning / critical | ≥ 90 % / ≥ 95 % used (writable filesystems) |
+| Filesystem is X % full (– *N* held by deleted files / *process* is writing to it) | warning / critical | ≥ 90 % / ≥ 95 % used (writable filesystems); names deleted-but-open files and current writers |
 | Filesystem is filling up quickly | warning | free space declined steadily for ≥ 10 min and would run out within 24 h at that rate (estimate, labelled as such) |
 | Filesystem is running out of inodes | warning / critical | ≥ 90 % / ≥ 95 % of inodes used |
 | Damaged frames are received on *iface* | warning | CRC / alignment / length errors in ≥ 3 samples |
@@ -54,7 +55,7 @@ findings. Each finding has three clearly separated parts:
 | TCP retransmissions are mostly retries to a full listen queue | info | as above while this host's own listen queue drops |
 | Incoming TCP connections dropped at *addr* (*process*) | warning | listen queue drops in ≥ 2 samples; names listener, process and queue length |
 | Many sockets in TIME_WAIT | info | ≥ 30 000 |
-| Tasks persistently blocked on I/O | info | ≥ 2 tasks blocked (sustained) |
+| Tasks are persistently blocked (waiting for *NFS / disk I/O / journal / …*) | info | ≥ 2 tasks blocked (sustained); groups them by kernel wait location |
 | Many zombie processes | info | ≥ 20 zombies; parents listed |
 | File handle limit nearly reached | warning / critical | ≥ 80 % / ≥ 95 % of `fs.file-max` |
 
@@ -84,6 +85,31 @@ Drops that none of these counters explain – transmit queue (qdisc) drops,
 bond backup members, XDP/eBPF or bridge filtering – are reported as such,
 with the list of causes that were ruled out and commands that can locate
 them (`tc -s qdisc`, `/proc/net/bonding`, `perf … skb:kfree_skb`).
+
+## Finding the source of disk and memory problems
+
+The same idea applies beyond the network: cheap signals on every sample,
+details only while there is a problem.
+
+- **Disk pressure** (iowait ≥ 10 %, a disk ≥ 60 % busy, I/O pressure ≥ 10 %
+  or a filesystem ≥ 85 % full) switches on per-process I/O accounting for
+  10 minutes on every screen, so the I/O finding lists the processes doing
+  the I/O.
+- **Full filesystems:** at most every 30 s Tirnix looks for deleted files that
+  are still held open (`/proc/<pid>/fd` links ending in `(deleted)`) and for
+  the files the busiest writers have open for writing (`fdinfo` flags). Both
+  are matched to the filesystem by device id. If deleted files account for
+  a large share of the used space, the finding says so in its title and
+  names the process to restart.
+- **Memory growth:** the RSS of processes larger than 64 MiB is recorded
+  every 30 s for 30 minutes. Steady growth (mostly increasing, ≥ 10 min,
+  ≥ 256 MiB and ≥ 25 %) is reported with the rate and an estimate of how
+  long the available memory would last; one-off jumps are ignored. This
+  needs a running TUI session (`tirnix report` samples for too short a time).
+- **Blocked tasks:** for processes in state `D` Tirnix reads
+  `/proc/<pid>/wchan` and groups them by what the kernel function means
+  (NFS, SMB, FUSE, journal, disk I/O, locks). The kernel shows wait
+  locations of other users' processes only to root.
 
 The **Data sources** list on the Diagnostics screen shows which inputs were
 available; a rule whose inputs are missing simply cannot fire.

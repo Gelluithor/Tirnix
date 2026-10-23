@@ -22,6 +22,7 @@ src/
 ├── collect/
 │   ├── mod.rs         Collector: owns previous counters, turns them into a Snapshot
 │   ├── procfs.rs      Pure parsers for /proc text formats (unit tested)
+│   ├── files.rs       Deleted-but-open and written files via /proc/<pid>/fd
 │   ├── fs.rs          Mount table filtering + statvfs
 │   ├── netdiag.rs     Network drop analysis: classify drops, find sockets/processes
 │   └── process.rs     /proc/<pid> scanning, per-process CPU / RSS / I/O
@@ -78,7 +79,9 @@ in the screens that show it.
 * "Escalation": detailed sources are read only while cheap counters show a
   problem. Network drop analysis reads socket tables, `/proc/<pid>/fd` and
   `/proc/interrupts` only while drops occur, at most every 5 s, and caches
-  socket owners for a minute.
+  socket owners for a minute. Disk pressure enables per-process I/O and
+  open-file scans (every 30 s) for 10 minutes; memory growth tracking keeps
+  one RSS point per 30 s for processes over 64 MiB.
 
 ## Diagnostics
 

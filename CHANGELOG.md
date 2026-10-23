@@ -6,25 +6,92 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-### Added
+## [0.2.0] - 2026-10-23
 
-- Network drop analysis that finds *where* packets are lost and *who* is
-  affected: damaged frames, NIC receive ring overflows (with the CPUs that
-  handle the interrupts), kernel receive backlog per CPU, UDP sockets with
-  full receive buffers (socket, process, user), full TCP accept queues
-  (listener, process, queue length), a full connection tracking table and
-  TCP memory-pressure drops. Unexplained drops list what was ruled out.
-- TCP retransmissions are attributed to peers and processes; SYN
-  retransmissions are recognised as unanswered connection attempts and
-  linked to this host's own full listen queue when that is the cause.
-- "Drop analysis" panel on the Network screen while drops occur.
-- New stored metrics: NIC overruns, damaged frames, backlog drops, UDP
-  buffer drops, conntrack usage and drops, TCP receive-side drops.
+Tirnix 0.2.0 makes the diagnostics answer the next question you would ask:
+not just *that* something is wrong, but *where* it happens and *which
+process* is behind it. Everything new follows the same rule as before:
+cheap counters on every sample, detailed inspection only while a problem is
+actually happening – so the overhead in a healthy system is unchanged
+(TUI about 0.6 % of one core, logger about 0.03 % at a 10 s interval).
 
-### Changed
+### Find the source of network drops
 
-- Socket owners that are not visible without root are reported with their
-  user instead of being omitted.
+Interface counters only tell you that packets are lost. Tirnix now works
+out where they are lost and who is affected:
+
+- **UDP sockets with full receive buffers** – names the socket, the process
+  and its user, with the current drop rate, e.g. *"UDP socket 0.0.0.0:514
+  (rsyslogd) drops datagrams: receive buffer full"*.
+- **Full TCP accept queues** – names the listening port, the process and how
+  many connections are waiting, e.g. *"Incoming TCP connections dropped at
+  [::]:8080 (java)"*.
+- **NIC receive ring overflows** – shows which CPUs handle the interface's
+  interrupts and how busy they are, pointing at missing RSS / irqbalance.
+- **Kernel receive backlog** – names the CPUs that cannot keep up.
+- **Damaged frames** (CRC / alignment / length errors) – cable, port or
+  duplex problems.
+- **Full connection tracking table** – reported as critical when packets
+  are dropped, as a warning above 90 %.
+- **TCP memory-pressure drops** – pruned, backlog and receive-queue drops.
+- **Harmless frames** for protocols the host does not use are recognised
+  and labelled as such.
+- **Unexplained drops** are reported honestly, together with the list of
+  causes the counters ruled out and commands to dig further.
+
+A new **Drop analysis** panel on the Network screen shows these sources
+while drops occur.
+
+### Smarter TCP retransmission findings
+
+- Retransmissions are attributed to remote peers and the local processes
+  involved.
+- SYN retransmissions are recognised as unanswered connection attempts.
+- When clients merely retry connections to this host's own full listen
+  queue, the retransmissions are reported as a consequence (info) instead
+  of a second, misleading warning.
+
+### Find out what fills a disk
+
+- A full filesystem now names **deleted files that are still held open** –
+  space that `du` cannot see – and the process holding them. If they make
+  up a large share of the used space, the finding says so in its title and
+  suggests restarting that process.
+- It also names the **processes writing to that filesystem right now**,
+  with their write rate and the files they are writing.
+- Under disk pressure, **per-process I/O is collected on every screen**, so
+  the I/O bottleneck finding lists the processes doing the I/O.
+
+### Spot memory leaks
+
+- Processes whose resident memory **grows steadily** (at least 10 minutes,
+  256 MiB and 25 %) are reported with the growth rate and an estimate of
+  how long the available memory would last. One-off jumps such as a cache
+  warming up are ignored.
+- The low-memory finding points to the fastest growing process.
+
+### Know what blocked processes wait for
+
+- Processes stuck in uninterruptible sleep (state `D`) are grouped by what
+  they wait for – an NFS or SMB server, a FUSE filesystem, the filesystem
+  journal, disk I/O or a kernel lock – and the findings say so in the title,
+  e.g. *"Tasks are persistently blocked waiting for an NFS server"*.
+
+### Also changed
+
+- Processes that are not visible without root are reported with the user
+  that owns the socket instead of being left out.
+- New stored and chartable metrics: NIC overruns, damaged frames, receive
+  backlog drops, UDP buffer drops, conntrack usage and drops, TCP
+  receive-side drops.
+- Release notes on GitHub no longer break lines in the middle of sentences.
+
+### Notes
+
+- Identifying other users' processes (socket owners, open files, wait
+  locations) requires root; without it Tirnix says what it could not see.
+- Memory growth detection needs a running TUI session; `tirnix report`
+  samples for too short a time.
 
 ## [0.1.0] - 2026-10-23
 
@@ -95,5 +162,6 @@ version 3 or (at your option) any later version (`GPL-3.0-or-later`).
 - cgroup (container) memory limits are not evaluated; memory figures are
   system-wide.
 
-[Unreleased]: https://github.com/Gelluithor/Tirnix/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Gelluithor/Tirnix/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Gelluithor/Tirnix/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Gelluithor/Tirnix/releases/tag/v0.1.0

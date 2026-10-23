@@ -98,6 +98,13 @@ const TIME_WAIT_HIGH: f64 = 30_000.0;
 const ZOMBIES_HIGH: usize = 20;
 const FD_WARN_PCT: f64 = 80.0;
 const FD_CRIT_PCT: f64 = 95.0;
+/// Processes at least this large are watched for memory growth.
+const RSS_TRACK_MIN: u64 = 64 * 1024 * 1024;
+const RSS_SAMPLE_SECS: i64 = 30;
+const RSS_WINDOW_SECS: i64 = 1800;
+/// Growth must last this long and be this large (and ≥ 25 % of the start).
+const RSS_GROWTH_MIN_SECS: i64 = 600;
+const RSS_GROWTH_MIN_BYTES: u64 = 256 * 1024 * 1024;
 /// Samples with drops needed within the sustain window.
 const MIN_DROP_SAMPLES: usize = 3;
 const CONNTRACK_WARN_PCT: f64 = 90.0;
@@ -109,6 +116,29 @@ pub struct Engine {
     oom_baseline: Option<u64>,
     fs_trend: HashMap<String, VecDeque<(i64, u64)>>,
     net_seen: NetSeen,
+    rss: HashMap<u32, RssTrack>,
+}
+
+/// Resident memory of one process over time (sampled every 30 s).
+struct RssTrack {
+    comm: String,
+    points: VecDeque<(i64, u64)>,
+}
+
+/// A process whose memory grew steadily.
+#[derive(Debug, Clone)]
+struct Growth {
+    pid: u32,
+    comm: String,
+    from: u64,
+    to: u64,
+    secs: i64,
+}
+
+impl Growth {
+    fn per_hour(&self) -> f64 {
+        (self.to - self.from) as f64 / self.secs as f64 * 3600.0
+    }
 }
 
 impl Engine {
@@ -118,6 +148,7 @@ impl Engine {
             oom_baseline: None,
             fs_trend: HashMap::new(),
             net_seen: NetSeen::default(),
+            rss: HashMap::new(),
         }
     }
 
@@ -142,7 +173,59 @@ impl Engine {
         rule_tcp(&ctx, &self.net_seen, &mut out);
         rule_processes(&ctx, &mut out);
         rule_file_handles(&ctx, &mut out);
+        let growth = self.track_rss(s, now);
+        rule_mem_growth(&ctx, &growth, &mut out);
         out.sort_by_key(|a| std::cmp::Reverse(a.severity));
+        out
+    }
+
+    /// Record RSS of larger processes and return those that grew steadily.
+    fn track_rss(&mut self, s: &Snapshot, now: i64) -> Vec<Growth> {
+        let Some(p) = &s.procs else {
+            return Vec::new();
+        };
+        let mut alive = std::collections::HashSet::new();
+        for x in p.list.iter().filter(|x| x.rss >= RSS_TRACK_MIN) {
+            alive.insert(x.pid);
+            let t = self.rss.entry(x.pid).or_insert_with(|| RssTrack {
+                comm: x.comm.clone(),
+                points: VecDeque::new(),
+            });
+            if t.comm != x.comm {
+                // PID reused by another program.
+                t.comm = x.comm.clone();
+                t.points.clear();
+            }
+            if t.points
+                .back()
+                .is_none_or(|(at, _)| now - at >= RSS_SAMPLE_SECS)
+            {
+                t.points.push_back((now, x.rss));
+            }
+            while t
+                .points
+                .front()
+                .is_some_and(|(at, _)| now - at > RSS_WINDOW_SECS)
+            {
+                t.points.pop_front();
+            }
+        }
+        self.rss.retain(|pid, _| alive.contains(pid));
+        let mut out: Vec<Growth> = self
+            .rss
+            .iter()
+            .filter_map(|(pid, t)| {
+                let g = steady_growth(&t.points)?;
+                Some(Growth {
+                    pid: *pid,
+                    comm: t.comm.clone(),
+                    from: g.0,
+                    to: g.1,
+                    secs: g.2,
+                })
+            })
+            .collect();
+        out.sort_by_key(|a| std::cmp::Reverse(a.to - a.from));
         out
     }
 
@@ -229,6 +312,16 @@ impl Engine {
                         fmt_duration(secs)
                     ));
                 }
+                let a = fs_attribution(c, f);
+                if let Some(t) = &a.title_suffix {
+                    fd.title = format!("{} – {t}", fd.title);
+                }
+                for x in a.facts {
+                    fd = fd.fact(x);
+                }
+                for x in a.causes {
+                    fd = fd.cause(x);
+                }
                 out.push(
                     fd.cause("Growing log files or journals.")
                         .cause("Backups, core dumps, caches or container images accumulating.")
@@ -272,6 +365,107 @@ impl Engine {
         }
         self.fs_trend.retain(|k, _| seen.contains(k));
     }
+}
+
+#[derive(Default)]
+struct FsAttribution {
+    title_suffix: Option<String>,
+    facts: Vec<String>,
+    causes: Vec<String>,
+}
+
+/// Who uses the space of a filesystem: deleted-but-open files on it and the
+/// processes currently writing files on it.
+fn fs_attribution(c: &Ctx, f: &crate::metrics::FsStats) -> FsAttribution {
+    let mut a = FsAttribution::default();
+    let files = &c.s.files;
+    if files.age.is_none() || f.dev == 0 {
+        return a;
+    }
+    let deleted: Vec<&crate::metrics::OpenFile> =
+        files.deleted.iter().filter(|d| d.dev == f.dev).collect();
+    if !deleted.is_empty() {
+        let total: u64 = deleted.iter().map(|d| d.size).sum();
+        let top = deleted[0];
+        a.facts.push(format!(
+            "{} of deleted files are still held open here, so their space is not freed. Largest: {} (pid {}) holds {} ({}).",
+            fmt_bytes(total as f64),
+            top.comm,
+            top.pid,
+            top.path,
+            fmt_bytes(top.size as f64)
+        ));
+        for d in deleted.iter().skip(1).take(3) {
+            a.facts.push(format!(
+                "Also deleted but open: {} ({}) by {} (pid {}).",
+                d.path,
+                fmt_bytes(d.size as f64),
+                d.comm,
+                d.pid
+            ));
+        }
+        // The main explanation when it is a large share of the used space.
+        if total >= 1 << 30 || total * 5 >= f.used {
+            a.title_suffix = Some(format!("{} held by deleted files", fmt_bytes(total as f64)));
+            a.causes.push(format!(
+                "Restarting {} (or making it reopen its files, e.g. a log rotation signal) would free {}.",
+                top.comm,
+                fmt_bytes(total as f64)
+            ));
+        }
+    }
+    // Writers whose open files are on this filesystem.
+    let rates: std::collections::HashMap<u32, f64> =
+        c.s.procs
+            .as_ref()
+            .map(|p| {
+                p.list
+                    .iter()
+                    .filter_map(|x| Some((x.pid, x.write_bps?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+    let mut writers: Vec<(&crate::metrics::OpenFile, f64)> = files
+        .written
+        .iter()
+        .filter(|w| w.dev == f.dev)
+        .map(|w| (w, rates.get(&w.pid).copied().unwrap_or(0.0)))
+        .collect();
+    writers.sort_by(|x, y| y.1.total_cmp(&x.1));
+    let mut named = Vec::new();
+    for (w, rate) in writers.iter().take(4) {
+        if named.contains(&w.pid) {
+            continue;
+        }
+        named.push(w.pid);
+        if *rate > 0.0 {
+            a.facts.push(format!(
+                "Writing here now: {} (pid {}) at {} – e.g. {} ({}).",
+                w.comm,
+                w.pid,
+                fmt_rate(*rate),
+                w.path,
+                fmt_bytes(w.size as f64)
+            ));
+        } else {
+            a.facts.push(format!(
+                "Open for writing here (no writes measured right now): {} (pid {}) – {} ({}).",
+                w.comm,
+                w.pid,
+                w.path,
+                fmt_bytes(w.size as f64)
+            ));
+        }
+    }
+    if a.title_suffix.is_none()
+        && let Some((w, _)) = writers.first().filter(|(_, r)| *r > 0.0)
+    {
+        a.title_suffix = Some(format!("{} is writing to it", w.comm));
+    }
+    if files.hidden && (deleted.is_empty() || writers.is_empty()) {
+        a.facts.push("Some processes could not be inspected without root, so the lists above may be incomplete.".into());
+    }
+    a
 }
 
 /// (seconds until full, bytes per second consumed) when free space has been
@@ -432,6 +626,13 @@ fn rule_cpu(c: &Ctx, out: &mut Vec<Finding>) {
             .fact(format!(
                 "{blocked} task(s) currently blocked on I/O; {dstate} process(es) in uninterruptible sleep (D)."
             ));
+        let w = blocked_summary(c);
+        for x in &w.facts {
+            f = f.fact(x.clone());
+        }
+        if let Some(cause) = &w.cause {
+            f = f.cause(cause.clone());
+        }
         out.push(
             f.cause("On Linux, tasks waiting for disk or network storage (state D) count towards load even though they use no CPU.")
                 .cause("A slow or hung storage device or NFS mount.")
@@ -490,6 +691,9 @@ fn rule_io(c: &Ctx, out: &mut Vec<Finding>) {
     }
     if let Some(p) = c.psi_fact("I/O", c.s.psi_io) {
         f = f.fact(p);
+    }
+    for x in blocked_summary(c).facts {
+        f = f.fact(x);
     }
     if let Some(p) = &c.s.procs
         && p.io_collected
@@ -1247,32 +1451,211 @@ fn rule_tcp(c: &Ctx, seen: &NetSeen, out: &mut Vec<Finding>) {
     }
 }
 
+/// (first RSS, last RSS, seconds) when memory grew steadily and markedly.
+fn steady_growth(points: &VecDeque<(i64, u64)>) -> Option<(u64, u64, i64)> {
+    let (t0, a) = *points.front()?;
+    let (t1, b) = *points.back()?;
+    let steps = points.len().checked_sub(1)?;
+    if t1 - t0 < RSS_GROWTH_MIN_SECS || b <= a || steps < 5 {
+        return None;
+    }
+    let grew = b - a;
+    if grew < RSS_GROWTH_MIN_BYTES || grew * 4 < a {
+        return None;
+    }
+    let pairs = || points.iter().zip(points.iter().skip(1));
+    let not_down = pairs().filter(|(x, y)| y.1 >= x.1).count();
+    let up = pairs().filter(|(x, y)| y.1 > x.1).count();
+    (not_down * 10 >= steps * 8 && up * 2 >= steps).then_some((a, b, t1 - t0))
+}
+
+fn rule_mem_growth(c: &Ctx, growth: &[Growth], out: &mut Vec<Finding>) {
+    let Some(m) = &c.s.mem else { return };
+    let avail = m.info.available.unwrap_or(0);
+    let tight = avail * 5 < m.info.total;
+    for g in growth.iter().take(3) {
+        let sev = if tight {
+            Severity::Warning
+        } else {
+            Severity::Info
+        };
+        let mut f = Finding::new(
+            format!("mem-growth:{}", g.pid),
+            sev,
+            format!(
+                "{} (pid {}) keeps growing: +{} in {}",
+                g.comm,
+                g.pid,
+                fmt_bytes((g.to - g.from) as f64),
+                fmt_duration(g.secs as f64)
+            ),
+        )
+        .fact(format!(
+            "Resident memory rose steadily from {} to {} (about {}/h).",
+            fmt_bytes(g.from as f64),
+            fmt_bytes(g.to as f64),
+            fmt_bytes(g.per_hour())
+        ));
+        if avail > 0 && g.per_hour() > 0.0 {
+            f = f.fact(format!(
+                "{} is available now; at this rate it would last ~{} (estimate, assuming nothing else changes).",
+                fmt_bytes(avail as f64),
+                fmt_duration(avail as f64 / g.per_hour() * 3600.0)
+            ));
+        }
+        out.push(
+            f.cause("A memory leak: allocations that are never freed.")
+                .cause("A cache or heap that grows by design until a configured limit (databases, JVM, browsers) – check its settings before calling it a leak.")
+                .cause("A growing amount of work (queues, sessions, open connections) kept in memory.")
+                .check(format!("ps -o pid,rss,vsz,etime,cmd -p {}", g.pid))
+                .check(format!("grep -E 'Rss|Anon|Swap' /proc/{}/smaps_rollup", g.pid))
+                .check(format!("pmap -x {} | sort -k3 -n | tail   # largest mappings", g.pid)),
+        );
+    }
+    // Point the low-memory finding at the growing processes.
+    if let (Some(low), Some(g)) = (out.iter_mut().find(|x| x.id == "mem-low"), growth.first()) {
+        low.facts.push(format!(
+            "Fastest growing process: {} (pid {}), +{} in {} (see its own finding).",
+            g.comm,
+            g.pid,
+            fmt_bytes((g.to - g.from) as f64),
+            fmt_duration(g.secs as f64)
+        ));
+    }
+}
+
+/// What a kernel wait function usually means.
+fn wchan_meaning(w: &str) -> &'static str {
+    let w = w.to_ascii_lowercase();
+    let has = |p: &[&str]| p.iter().any(|x| w.starts_with(x) || w.contains(x));
+    if has(&["nfs", "rpc_", "__rpc"]) {
+        "an NFS server"
+    } else if has(&["cifs", "smb"]) {
+        "an SMB/CIFS server"
+    } else if has(&["fuse"]) {
+        "a FUSE filesystem"
+    } else if has(&["jbd2", "journal"]) {
+        "the filesystem journal"
+    } else if has(&[
+        "io_schedule",
+        "blk_",
+        "bio_",
+        "wait_on_page",
+        "folio_wait",
+        "wait_on_buffer",
+        "submit_bio",
+        "rq_qos",
+    ]) {
+        "disk I/O"
+    } else if has(&["ext4", "xfs", "btrfs", "f2fs", "zfs"]) {
+        "a filesystem operation"
+    } else if has(&["mutex", "rwsem", "down_", "lock"]) {
+        "a kernel lock"
+    } else if has(&["swap", "page_fault", "do_page"]) {
+        "memory paging"
+    } else {
+        "something else in the kernel"
+    }
+}
+
+#[derive(Default)]
+struct BlockedSummary {
+    /// The most common wait reason, if known.
+    main: Option<&'static str>,
+    facts: Vec<String>,
+    cause: Option<String>,
+}
+
+/// Group processes in state D by what they wait for.
+fn blocked_summary(c: &Ctx) -> BlockedSummary {
+    let mut s = BlockedSummary::default();
+    let Some(p) = &c.s.procs else { return s };
+    let blocked: Vec<&ProcInfo> = p.list.iter().filter(|x| x.state == 'D').collect();
+    if blocked.is_empty() {
+        return s;
+    }
+    let mut groups: Vec<(&'static str, Vec<String>)> = Vec::new();
+    let mut unknown = Vec::new();
+    for x in &blocked {
+        let who = format!("{} ({})", x.comm, x.pid);
+        match &x.wchan {
+            Some(w) => {
+                let m = wchan_meaning(w);
+                let entry = format!("{who} in {w}");
+                match groups.iter_mut().find(|(k, _)| *k == m) {
+                    Some((_, v)) => v.push(entry),
+                    None => groups.push((m, vec![entry])),
+                }
+            }
+            None => unknown.push(who),
+        }
+    }
+    groups.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (m, v) in &groups {
+        let more = if v.len() > 4 {
+            format!(" and {} more", v.len() - 4)
+        } else {
+            String::new()
+        };
+        s.facts.push(format!(
+            "Waiting for {m}: {}{more}.",
+            v.iter().take(4).cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if !unknown.is_empty() {
+        s.facts.push(format!(
+            "In state D, wait location not visible{}: {}.",
+            if groups.is_empty() {
+                " (the kernel shows it only to root)"
+            } else {
+                ""
+            },
+            unknown
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some((m, _)) = groups.first() {
+        s.main = Some(m);
+        s.cause = Some(match *m {
+            "an NFS server" => "The NFS server is slow or unreachable; every process touching the mount hangs until it answers.".into(),
+            "an SMB/CIFS server" => "The SMB/CIFS server is slow or unreachable.".into(),
+            "a FUSE filesystem" => "The FUSE daemon behind the mount (sshfs, rclone, …) is stuck or its backend is slow.".into(),
+            "the filesystem journal" => "Journal commits are slow: the disk is saturated or many fsync() calls queue up.".into(),
+            "disk I/O" => "The block device answers slowly (saturated or failing disk).".into(),
+            other => format!("Most blocked tasks wait for {other}."),
+        });
+    }
+    s
+}
+
 fn rule_processes(c: &Ctx, out: &mut Vec<Finding>) {
     let Some(p) = &c.s.procs else { return };
     if c.sustained(|r| r.procs_blocked.map(|v| v >= 2.0)) && p.uninterruptible > 0 {
-        let names: Vec<String> = p
-            .list
-            .iter()
-            .filter(|x| x.state == 'D')
-            .take(5)
-            .map(|x| format!("{} ({})", x.comm, x.pid))
-            .collect();
+        let w = blocked_summary(c);
+        let title = match &w.main {
+            Some(m) => format!("Tasks are persistently blocked waiting for {m}"),
+            None => "Tasks are persistently blocked on I/O".to_string(),
+        };
+        let mut f = Finding::new("tasks-blocked", Severity::Info, title).fact(format!(
+            "At least 2 tasks blocked on I/O on most samples {}; now {} in state D.",
+            c.window_desc(),
+            p.uninterruptible
+        ));
+        for x in &w.facts {
+            f = f.fact(x.clone());
+        }
+        if let Some(cause) = &w.cause {
+            f = f.cause(cause.clone());
+        }
         out.push(
-            Finding::new(
-                "tasks-blocked",
-                Severity::Info,
-                "Tasks are persistently blocked on I/O",
-            )
-            .fact(format!(
-                "At least 2 tasks blocked on I/O on most samples {}; now {} in state D: {}.",
-                c.window_desc(),
-                p.uninterruptible,
-                names.join(", ")
-            ))
-            .cause("Slow storage, or a hung NFS / network filesystem.")
-            .cause("Heavy synchronous writes (fsync) by databases or backups.")
-            .check("ps -eo state,pid,user,wchan:32,comm | awk '$1==\"D\"'")
-            .check("cat /proc/<pid>/stack   # as root"),
+            f.cause("Slow storage, or a hung NFS / network filesystem.")
+                .cause("Heavy synchronous writes (fsync) by databases or backups.")
+                .check("ps -eo state,pid,user,wchan:32,comm | awk '$1==\"D\"'")
+                .check("cat /proc/<pid>/stack   # as root"),
         );
     }
     if p.zombies >= ZOMBIES_HIGH {
@@ -1827,6 +2210,165 @@ mod tests {
         assert_eq!(ids(&f), vec!["tcp-listen-drops"]);
         assert!(f[0].title.contains("[::]:8080") && f[0].title.contains("java"));
         assert!(f[0].facts.iter().any(|x| x.contains("129 connection")));
+    }
+
+    fn proc_info(pid: u32, comm: &str, rss: u64) -> ProcInfo {
+        ProcInfo {
+            pid,
+            comm: comm.into(),
+            state: 'S',
+            rss,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn steady_memory_growth_is_found_jumps_are_not() {
+        const MIB: u64 = 1024 * 1024;
+        let mut e = Engine::new(30);
+        let w = window_with(10_000, 10, |_| {});
+        let mut last = Vec::new();
+        for i in 0..=26 {
+            let now = 10_000 + i * 30;
+            let mut s = snapshot(now);
+            s.mem = Some(MemStats {
+                info: MemInfo {
+                    total: 16 * 1024 * MIB,
+                    available: Some(8 * 1024 * MIB),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let jumpy = if i < 3 { 200 * MIB } else { 900 * MIB };
+            s.procs = Some(ProcSummary {
+                list: vec![
+                    proc_info(42, "leaky", 400 * MIB + i as u64 * 40 * MIB),
+                    proc_info(43, "cache", jumpy),
+                ],
+                ..Default::default()
+            });
+            last = e.evaluate(&s, &w);
+        }
+        assert_eq!(ids(&last), vec!["mem-growth:42"]);
+        assert_eq!(last[0].severity, Severity::Info);
+        assert!(
+            last[0]
+                .title
+                .starts_with("leaky (pid 42) keeps growing: +1.02 GiB")
+        );
+    }
+
+    #[test]
+    fn full_filesystem_names_deleted_files_and_writers() {
+        const GIB: u64 = 1 << 30;
+        let now = 10_000;
+        let w = window_with(now, 10, |_| {});
+        let mut s = snapshot(now);
+        s.filesystems = vec![FsStats {
+            mount_point: "/var".into(),
+            total: 20 * GIB,
+            used: 19 * GIB + GIB / 2,
+            avail: GIB / 2,
+            dev: 2049,
+            ..Default::default()
+        }];
+        s.procs = Some(ProcSummary {
+            list: vec![ProcInfo {
+                pid: 700,
+                comm: "postgres".into(),
+                write_bps: Some(30.0 * 1024.0 * 1024.0),
+                ..Default::default()
+            }],
+            io_collected: true,
+            ..Default::default()
+        });
+        let file = |pid: u32, comm: &str, path: &str, size: u64, dev: u64| OpenFile {
+            pid,
+            comm: comm.into(),
+            path: path.into(),
+            size,
+            dev,
+            writing: true,
+        };
+        s.files = FileDiag {
+            deleted: vec![
+                file(12, "nginx", "/var/log/nginx/access.log.1", 6 * GIB, 2049),
+                file(13, "other", "/tmp/x", 3 * GIB, 99),
+            ],
+            written: vec![file(700, "postgres", "/var/lib/pg/wal/0001", GIB, 2049)],
+            hidden: false,
+            age: Some(3.0),
+        };
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(f[0].id, "fs-space:/var");
+        assert!(
+            f[0].title.contains("6.00 GiB held by deleted files"),
+            "{}",
+            f[0].title
+        );
+        assert!(
+            f[0].facts
+                .iter()
+                .any(|x| x.contains("nginx (pid 12)") && x.contains("access.log.1"))
+        );
+        assert!(
+            !f[0].facts.iter().any(|x| x.contains("/tmp/x")),
+            "other filesystem"
+        );
+        assert!(
+            f[0].facts
+                .iter()
+                .any(|x| x.starts_with("Writing here now: postgres (pid 700)"))
+        );
+        assert!(f[0].causes[0].contains("Restarting nginx"));
+    }
+
+    #[test]
+    fn blocked_tasks_say_what_they_wait_for() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| r.procs_blocked = Some(3.0));
+        let mut s = snapshot(now);
+        let d = |pid: u32, comm: &str, wchan: Option<&str>| ProcInfo {
+            pid,
+            comm: comm.into(),
+            state: 'D',
+            wchan: wchan.map(String::from),
+            ..Default::default()
+        };
+        s.procs = Some(ProcSummary {
+            list: vec![
+                d(1, "rsync", Some("nfs_wait_bit_killable")),
+                d(2, "ls", Some("rpc_wait_bit_killable")),
+                d(3, "app", None),
+            ],
+            uninterruptible: 3,
+            ..Default::default()
+        });
+        let f = Engine::new(30).evaluate(&s, &w);
+        let b = f.iter().find(|x| x.id == "tasks-blocked").unwrap();
+        assert_eq!(
+            b.title,
+            "Tasks are persistently blocked waiting for an NFS server"
+        );
+        assert!(
+            b.facts
+                .iter()
+                .any(|x| x.contains("rsync (1) in nfs_wait_bit_killable"))
+        );
+        assert!(b.facts.iter().any(|x| x.contains("app (3)")));
+        assert!(b.causes[0].contains("NFS server"));
+    }
+
+    #[test]
+    fn wchan_meanings() {
+        assert_eq!(wchan_meaning("io_schedule"), "disk I/O");
+        assert_eq!(
+            wchan_meaning("jbd2_log_wait_commit"),
+            "the filesystem journal"
+        );
+        assert_eq!(wchan_meaning("fuse_wait_answer"), "a FUSE filesystem");
+        assert_eq!(wchan_meaning("folio_wait_bit_common"), "disk I/O");
+        assert_eq!(wchan_meaning("whatever"), "something else in the kernel");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! turns their deltas into a [`Snapshot`]. It performs no network I/O and
 //! writes nothing to disk.
 
+pub mod files;
 pub mod fs;
 pub mod netdiag;
 pub mod process;
@@ -48,6 +49,10 @@ impl Default for Options {
 /// How often slow-changing or more expensive data is refreshed.
 const FS_REFRESH: Duration = Duration::from_secs(5);
 const META_REFRESH: Duration = Duration::from_secs(60);
+/// How long detailed disk attribution stays on after the last pressure.
+const ESCALATE_FOR: Duration = Duration::from_secs(600);
+/// Minimum time between two scans of open files.
+const FILES_SCAN_EVERY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct DiskMeta {
@@ -77,6 +82,9 @@ pub struct Collector {
     net_virtual: HashMap<String, bool>,
     meta_time: Option<Instant>,
     netprobe: netdiag::NetProbe,
+    /// Per-process I/O and open-file scans stay on until then.
+    disk_escalated_until: Option<Instant>,
+    files_scan: Option<(Instant, FileDiag)>,
     /// Interfaces whose drop/error counters moved in the current sample.
     net_active: Vec<String>,
 }
@@ -107,6 +115,8 @@ impl Collector {
             net_virtual: HashMap::new(),
             meta_time: None,
             netprobe: netdiag::NetProbe::default(),
+            disk_escalated_until: None,
+            files_scan: None,
             net_active: Vec::new(),
         }
     }
@@ -164,9 +174,22 @@ impl Collector {
         }
 
         if self.opts.processes {
-            s.procs = self
-                .procs
-                .scan(self.opts.process_io, self.clk_tck, self.page_size);
+            // Under disk pressure, per-process I/O is read on every screen so
+            // diagnostics can name the processes doing the I/O.
+            let escalated = self.disk_escalated_until.is_some_and(|t| now < t);
+            s.procs = self.procs.scan(
+                self.opts.process_io || escalated,
+                self.clk_tck,
+                self.page_size,
+            );
+            if Self::disk_pressure(&s) {
+                self.disk_escalated_until = Some(now + ESCALATE_FOR);
+            }
+            if escalated {
+                self.scan_files(&mut s, now);
+            } else {
+                self.files_scan = None;
+            }
         }
 
         let mut host = self.host.clone();
@@ -181,6 +204,59 @@ impl Collector {
         s.host = host;
         self.prev_time = Some(now);
         s
+    }
+
+    /// Signs that disk I/O or disk space deserve a closer look.
+    fn disk_pressure(s: &Snapshot) -> bool {
+        let iowait = s
+            .cpu
+            .as_ref()
+            .and_then(|c| c.total)
+            .is_some_and(|u| u.iowait >= 10.0);
+        let util = s.busiest_disk().is_some_and(|d| d.util_pct >= 60.0);
+        let psi = s.psi_io.is_some_and(|p| p.some_avg10 >= 10.0);
+        let full = s
+            .filesystems
+            .iter()
+            .any(|f| !f.readonly && f.used_pct().is_some_and(|p| p >= 85.0));
+        iowait || util || psi || full
+    }
+
+    /// Deleted-but-open files and files written by the top writers.
+    fn scan_files(&mut self, s: &mut Snapshot, now: Instant) {
+        let due = self
+            .files_scan
+            .as_ref()
+            .is_none_or(|(t, _)| now.duration_since(*t) >= FILES_SCAN_EVERY);
+        if due {
+            let (deleted, h1) = files::deleted_open_files(20);
+            let mut writers: Vec<(u32, f64)> = s
+                .procs
+                .as_ref()
+                .map(|p| {
+                    p.list
+                        .iter()
+                        .filter_map(|x| Some((x.pid, x.write_bps.filter(|w| *w > 0.0)?)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            writers.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let pids: Vec<u32> = writers.iter().take(5).map(|w| w.0).collect();
+            let (written, h2) = files::written_files(&pids, 20);
+            self.files_scan = Some((
+                now,
+                FileDiag {
+                    deleted,
+                    written,
+                    hidden: h1 || h2,
+                    age: None,
+                },
+            ));
+        }
+        if let Some((t, d)) = &self.files_scan {
+            s.files = d.clone();
+            s.files.age = Some(now.duration_since(*t).as_secs_f64());
+        }
     }
 
     fn read_psi(&mut self, path: &str) -> Option<Psi> {

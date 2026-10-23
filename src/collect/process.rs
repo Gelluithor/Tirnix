@@ -109,6 +109,9 @@ impl ProcessScanner {
                 threads: st.num_threads,
                 read_bps,
                 write_bps,
+                wchan: (st.state == 'D')
+                    .then(|| read_wchan(pid, &mut self.path, &mut self.buf))
+                    .flatten(),
             });
             self.next.insert(
                 pid,
@@ -124,6 +127,16 @@ impl ProcessScanner {
         self.prev_time = Some(now);
         Some(sum)
     }
+}
+
+/// Where a blocked process waits in the kernel. Returns `None` when the
+/// kernel hides it (it prints `0` without sufficient privileges).
+fn read_wchan(pid: u32, path: &mut String, buf: &mut String) -> Option<String> {
+    path.clear();
+    let _ = write!(path, "/proc/{pid}/wchan");
+    read_into(path, buf).ok()?;
+    let w = buf.trim();
+    (!w.is_empty() && w != "0").then(|| w.to_string())
 }
 
 /// Full command line of a process, or `None` for kernel threads and

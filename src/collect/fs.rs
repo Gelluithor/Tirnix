@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::os::unix::fs::MetadataExt;
 
 use super::procfs::Mount;
 use crate::metrics::FsStats;
@@ -119,6 +120,7 @@ pub fn statvfs(path: &str) -> Option<FsStats> {
         // `c_ulong` is 32-bit on some targets, so the casts are not redundant everywhere.
         #[allow(clippy::unnecessary_cast)]
         readonly: (st.f_flag as u64) & (libc::ST_RDONLY as u64) != 0,
+        dev: std::fs::metadata(path).map(|m| m.dev()).unwrap_or(0),
         ..Default::default()
     })
 }

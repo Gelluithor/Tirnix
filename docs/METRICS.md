@@ -93,6 +93,12 @@ The filesystem list is refreshed every 5 seconds.
 
 CPU % of a process first seen in the current sample is shown as `–`.
 
+During disk pressure per-process I/O is read on every screen, and open
+files are inspected via `/proc/<pid>/fd` and `/proc/<pid>/fdinfo` (see
+[DIAGNOSTICS.md](DIAGNOSTICS.md#finding-the-source-of-disk-and-memory-problems)).
+For processes in state `D`, `/proc/<pid>/wchan` shows where they wait
+(visible to root for other users' processes).
+
 ## Network
 
 | Value | Source | Notes |

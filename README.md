@@ -36,6 +36,12 @@ measured facts and guesses apart.
   *measured*, *possible causes* (explicitly hypotheses) and *how to
   verify*. Rate-based rules need a sustained condition, so a single spike
   does not raise an alarm.
+- **Finds the source, not just the symptom.** Packet drops are traced to the
+  UDP socket, listen queue, NIC ring, CPU backlog or conntrack table – and
+  to the process behind it. A full disk names deleted files that are still
+  held open and the processes writing to it; steadily growing processes are
+  flagged as leak candidates; blocked tasks say whether they wait for NFS,
+  the disk or a journal. See [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md).
 - **Honest data.** Everything comes from `/proc`, `/sys` and `statvfs`. A
   missing source is shown as `n/a`, never estimated.
 - **Low overhead.** A single ~1.5 MB static binary. No daemon, database,
@@ -78,7 +84,7 @@ If you prefer to read the script first (recommended):
 curl -fsSLO https://raw.githubusercontent.com/Gelluithor/Tirnix/main/install.sh
 less install.sh
 sh install.sh                    # into ~/.local/bin
-sh install.sh --version 0.1.0    # a specific release
+sh install.sh --version 0.2.0    # a specific release
 sudo sh install.sh --system      # into /usr/local/bin for all users
 sh install.sh --dir ~/bin        # any directory
 ```
@@ -91,8 +97,8 @@ Download the package for your architecture from the
 [releases page](https://github.com/Gelluithor/Tirnix/releases), then:
 
 ```sh
-sudo apt install ./tirnix_0.1.0-1_amd64.deb      # Debian, Ubuntu
-sudo dnf install ./tirnix-0.1.0-1.x86_64.rpm     # Fedora, RHEL, Rocky, Alma
+sudo apt install ./tirnix_0.2.0-1_amd64.deb      # Debian, Ubuntu
+sudo dnf install ./tirnix-0.2.0-1.x86_64.rpm     # Fedora, RHEL, Rocky, Alma
 ```
 
 Packages install `/usr/bin/tirnix`, documentation and the optional systemd
@@ -172,7 +178,7 @@ Memory   823 MiB used of 3.82 GiB (3.02 GiB available)
 | `2` | **CPU & Memory** | CPU time split, per-core usage, context switches, PSI, detailed memory and swap, major faults, OOM kills, file handles |
 | `3` | **Disks** | Per-device throughput, IOPS, await, utilisation; filesystems with space and inode usage |
 | `4` | **Processes** | Sortable process list with CPU, memory, threads, disk I/O and full command line; filter |
-| `5` | **Network** | Interfaces with RX/TX, packets, errors, drops; TCP connections, retransmissions, listen drops, sockets |
+| `5` | **Network** | Interfaces with RX/TX, packets, errors, drops; TCP connections, retransmissions, listen drops, sockets; drop analysis while packets are lost |
 | `6` | **Diagnostics** | Findings with measured facts, hypotheses and verification commands; data source coverage; active checks |
 | `7` | **History** | Chart of any metric for the session or stored ranges (1 h … 30 days), comparison with the previous period |
 | `8` | **Settings** | Refresh interval, logging on/off, interval, metrics, directory, retention, size limit, active check targets |
