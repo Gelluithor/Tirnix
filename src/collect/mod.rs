@@ -5,6 +5,7 @@
 //! writes nothing to disk.
 
 pub mod fs;
+pub mod netdiag;
 pub mod process;
 pub mod procfs;
 
@@ -75,6 +76,9 @@ pub struct Collector {
     disk_meta: Option<HashMap<String, DiskMeta>>,
     net_virtual: HashMap<String, bool>,
     meta_time: Option<Instant>,
+    netprobe: netdiag::NetProbe,
+    /// Interfaces whose drop/error counters moved in the current sample.
+    net_active: Vec<String>,
 }
 
 impl Collector {
@@ -102,6 +106,8 @@ impl Collector {
             disk_meta: None,
             net_virtual: HashMap::new(),
             meta_time: None,
+            netprobe: netdiag::NetProbe::default(),
+            net_active: Vec::new(),
         }
     }
 
@@ -322,6 +328,7 @@ impl Collector {
         s.nets_available = true;
         let cur = parse_net_dev(&self.buf);
         let mut next = HashMap::with_capacity(cur.len());
+        self.net_active.clear();
         for n in cur {
             // Interfaces that never carried a packet (unused tunnel stubs
             // such as gre0 or sit0) are noise.
@@ -329,6 +336,16 @@ impl Collector {
                 continue;
             }
             if let (Some(p), Some(dt)) = (self.prev_nets.get(&n.name), dt) {
+                let moved = |c: u64, p: u64| c > p;
+                if moved(n.rx_drop, p.rx_drop)
+                    || moved(n.tx_drop, p.tx_drop)
+                    || moved(n.rx_errs, p.rx_errs)
+                    || moved(n.tx_errs, p.tx_errs)
+                    || moved(n.rx_fifo, p.rx_fifo)
+                    || moved(n.rx_frame, p.rx_frame)
+                {
+                    self.net_active.push(n.name.clone());
+                }
                 let r = |c: u64, p: u64| c.saturating_sub(p) as f64 / dt;
                 let stats = NetStats {
                     name: n.name.clone(),
@@ -361,12 +378,19 @@ impl Collector {
     }
 
     fn sample_tcp(&mut self, s: &mut Snapshot, dt: Option<f64>) {
-        if read_into("/proc/net/snmp", &mut self.buf).is_err() {
-            return;
-        }
+        let snmp_ok = read_into("/proc/net/snmp", &mut self.buf).is_ok();
         let netstat = read_into("/proc/net/netstat", &mut self.buf2)
             .is_ok()
             .then_some(self.buf2.as_str());
+        s.net_diag = self.netprobe.sample(
+            dt,
+            &self.net_active,
+            snmp_ok.then_some(self.buf.as_str()),
+            netstat,
+        );
+        if !snmp_ok {
+            return;
+        }
         let Some(cur) = parse_tcp(&self.buf, netstat) else {
             return;
         };

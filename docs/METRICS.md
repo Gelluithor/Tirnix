@@ -103,6 +103,11 @@ CPU % of a process first seen in the current sample is shown as `–`.
 | listen overflows / drops | `/proc/net/netstat` (`TcpExt:`) | |
 | sockets: in use, TIME_WAIT, orphans | `/proc/net/sockstat`, `/proc/net/sockstat6` | |
 
+Drop analysis (see [DIAGNOSTICS.md](DIAGNOSTICS.md#finding-the-source-of-network-drops)):
+`/proc/net/softnet_stat`, `/proc/net/snmp6` and conntrack counters are read
+on every sample; `/sys/class/net/<if>/statistics`, `/proc/interrupts`,
+`/proc/net/{tcp,udp}{,6}` and `/proc/<pid>/fd` only while drops occur.
+
 Interfaces that never carried a packet are hidden. All network values are
 for the network namespace Tirnix runs in.
 

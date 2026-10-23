@@ -13,7 +13,9 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::metrics::{ProcInfo, Snapshot};
+use crate::metrics::{
+    IfaceDiag, IrqShare, ListenQueue, ProcInfo, RetransPeer, Snapshot, SocketDrops, SoftnetCpu,
+};
 use crate::util::{fmt_bytes, fmt_count, fmt_duration, fmt_pct, fmt_rate};
 use crate::window::{self, Window};
 
@@ -96,6 +98,9 @@ const TIME_WAIT_HIGH: f64 = 30_000.0;
 const ZOMBIES_HIGH: usize = 20;
 const FD_WARN_PCT: f64 = 80.0;
 const FD_CRIT_PCT: f64 = 95.0;
+/// Samples with drops needed within the sustain window.
+const MIN_DROP_SAMPLES: usize = 3;
+const CONNTRACK_WARN_PCT: f64 = 90.0;
 
 /// Stateful rule engine (remembers OOM baseline and filesystem trends).
 pub struct Engine {
@@ -103,6 +108,7 @@ pub struct Engine {
     pub sustain_secs: i64,
     oom_baseline: Option<u64>,
     fs_trend: HashMap<String, VecDeque<(i64, u64)>>,
+    net_seen: NetSeen,
 }
 
 impl Engine {
@@ -111,6 +117,7 @@ impl Engine {
             sustain_secs: sustain_secs.max(1),
             oom_baseline: None,
             fs_trend: HashMap::new(),
+            net_seen: NetSeen::default(),
         }
     }
 
@@ -130,8 +137,9 @@ impl Engine {
         rule_memory(&ctx, &mut out);
         self.rule_oom(&ctx, &mut out);
         self.rule_filesystems(&ctx, &mut out);
-        rule_network(&ctx, &mut out);
-        rule_tcp(&ctx, &mut out);
+        self.net_seen.update(s, now);
+        rule_network(&ctx, &self.net_seen, &mut out);
+        rule_tcp(&ctx, &self.net_seen, &mut out);
         rule_processes(&ctx, &mut out);
         rule_file_handles(&ctx, &mut out);
         out.sort_by_key(|a| std::cmp::Reverse(a.severity));
@@ -298,6 +306,18 @@ struct Ctx<'a> {
 impl Ctx<'_> {
     fn sustained(&self, f: impl Fn(&crate::metrics::Record) -> Option<bool>) -> bool {
         self.w.sustained(self.now, self.secs, f)
+    }
+
+    /// Samples in the sustain window in which `key` was above zero.
+    fn count_positive(&self, key: &str) -> usize {
+        self.w
+            .since(self.now - self.secs)
+            .filter(|r| r.get(key).is_some_and(|v| v > 0.0))
+            .count()
+    }
+
+    fn repeated(&self, key: &str, min: usize) -> bool {
+        self.count_positive(key) >= min
     }
 
     fn avg(&self, key: &str) -> Option<f64> {
@@ -622,9 +642,401 @@ fn rule_memory(c: &Ctx, out: &mut Vec<Finding>) {
     }
 }
 
-fn rule_network(c: &Ctx, out: &mut Vec<Finding>) {
-    if c.sustained(|r| r.net_errors.map(|v| v > 0.0)) {
-        let ifaces: Vec<String> =
+/// Drop details seen recently. Drops are bursty, so the sample in which a
+/// rule fires may not be the one that showed which socket or CPU dropped.
+#[derive(Default)]
+struct NetSeen {
+    ifaces: HashMap<String, (i64, IfaceDiag)>,
+    softnet: Option<(i64, Vec<SoftnetCpu>)>,
+    udp_sockets: Option<(i64, Vec<SocketDrops>)>,
+    listeners: Option<(i64, Vec<ListenQueue>)>,
+    retrans_peers: Option<(i64, Vec<RetransPeer>)>,
+}
+
+impl NetSeen {
+    fn update(&mut self, s: &Snapshot, now: i64) {
+        let d = &s.net_diag;
+        for i in &d.ifaces {
+            let active = i.rx_dropped
+                + i.tx_dropped
+                + i.rx_corrupt
+                + i.rx_overrun
+                + i.rx_nohandler
+                + i.tx_errors;
+            let known_irq = self.ifaces.get(&i.name).and_then(|(_, x)| x.irq);
+            if active > 0.0 {
+                let mut i = i.clone();
+                // Keep the last known interrupt distribution.
+                i.irq = i.irq.or(known_irq);
+                self.ifaces.insert(i.name.clone(), (now, i));
+            }
+        }
+        if d.softnet.iter().any(|c| c.dropped > 0.0) {
+            self.softnet = Some((now, d.softnet.clone()));
+        }
+        if !d.udp_sockets.is_empty() {
+            self.udp_sockets = Some((now, d.udp_sockets.clone()));
+        }
+        if !d.listeners.is_empty() {
+            self.listeners = Some((now, d.listeners.clone()));
+        }
+        if !d.retrans_peers.is_empty() {
+            self.retrans_peers = Some((now, d.retrans_peers.clone()));
+        }
+    }
+
+    fn recent_ifaces(&self, since: i64) -> Vec<&IfaceDiag> {
+        let mut v: Vec<&IfaceDiag> = self
+            .ifaces
+            .values()
+            .filter(|(t, _)| *t >= since)
+            .map(|(_, i)| i)
+            .collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+}
+
+fn rule_network(c: &Ctx, seen: &NetSeen, out: &mut Vec<Finding>) {
+    let since = c.now - c.secs;
+    let ifaces = seen.recent_ifaces(since);
+    let d = &c.s.net_diag;
+    let mut explained_errors = false;
+
+    // 1. Damaged frames: a physical-layer problem.
+    if c.repeated("nic_rx_corrupt", MIN_DROP_SAMPLES) {
+        let bad: Vec<&&IfaceDiag> = ifaces.iter().filter(|i| i.rx_corrupt > 0.0).collect();
+        let names: Vec<&str> = bad.iter().map(|i| i.name.as_str()).collect();
+        let title = if names.is_empty() {
+            "Damaged frames are being received".to_string()
+        } else {
+            format!("Damaged frames are being received on {}", names.join(", "))
+        };
+        let mut f = Finding::new("net-corrupt", Severity::Warning, title).fact(format!(
+            "Frames with CRC, alignment or length errors in {} samples {} (avg {:.1}/s).",
+            c.count_positive("nic_rx_corrupt"),
+            c.window_desc(),
+            c.avg("nic_rx_corrupt").unwrap_or(0.0)
+        ));
+        for i in &bad {
+            f = f.fact(format!(
+                "{}: {:.1} damaged frames/s at the last occurrence.",
+                i.name, i.rx_corrupt
+            ));
+        }
+        explained_errors = true;
+        let n = names.first().copied().unwrap_or("<iface>");
+        out.push(
+            f.cause("A faulty cable, connector, transceiver (SFP) or switch port.")
+                .cause("A speed/duplex mismatch with the switch port.")
+                .cause("Electrical interference or a failing network card.")
+                .check(format!(
+                    "ethtool -S {n} | grep -iE 'crc|align|frame|symbol|length'"
+                ))
+                .check(format!("ethtool {n}   # negotiated speed and duplex"))
+                .check("Swap the cable or switch port and watch whether the counter keeps rising"),
+        );
+    }
+
+    // 2. NIC ring buffer overruns.
+    if c.repeated("nic_rx_overruns", MIN_DROP_SAMPLES) {
+        let bad: Vec<&&IfaceDiag> = ifaces.iter().filter(|i| i.rx_overrun > 0.0).collect();
+        let names: Vec<&str> = bad.iter().map(|i| i.name.as_str()).collect();
+        let title = if names.is_empty() {
+            "A network card runs out of receive buffers".to_string()
+        } else {
+            format!(
+                "{}: network card runs out of receive buffers",
+                names.join(", ")
+            )
+        };
+        let mut f = Finding::new("net-overrun", Severity::Warning, title).fact(format!(
+            "Receive overruns (missed / FIFO / over errors) in {} samples {} (avg {:.1}/s). These packets were lost before the kernel saw them.",
+            c.count_positive("nic_rx_overruns"),
+            c.window_desc(),
+            c.avg("nic_rx_overruns").unwrap_or(0.0)
+        ));
+        let mut single_cpu = false;
+        for i in &bad {
+            f = f.fact(format!(
+                "{}: {:.1} overruns/s at the last occurrence.",
+                i.name, i.rx_overrun
+            ));
+            if let Some(q) = i.irq {
+                f = f.fact(irq_fact(&i.name, q, c));
+                single_cpu |= q.top_share >= 90.0;
+            }
+        }
+        explained_errors = true;
+        let n = names.first().copied().unwrap_or("<iface>");
+        if single_cpu {
+            f = f.cause("All receive interrupts land on one CPU, which cannot drain the ring fast enough (no RSS / irqbalance).");
+        }
+        out.push(
+            f.cause("Traffic bursts larger than the receive ring.")
+                .cause("The CPU handling the interrupts is busy with other work.")
+                .check(format!(
+                    "ethtool -g {n}   # ring size; raise with: ethtool -G {n} rx <max>"
+                ))
+                .check(format!(
+                    "grep -E '{n}|CPU' /proc/interrupts   # which CPUs take its interrupts"
+                ))
+                .check(format!("ethtool -l {n}   # number of RX queues (RSS)"))
+                .check("systemctl status irqbalance"),
+        );
+    }
+
+    // 3. Kernel receive backlog per CPU.
+    if c.repeated("softnet_drops", MIN_DROP_SAMPLES) {
+        let cpus: Vec<SoftnetCpu> = seen
+            .softnet
+            .as_ref()
+            .filter(|(t, _)| *t >= since)
+            .map(|(_, v)| v.iter().filter(|x| x.dropped > 0.0).copied().collect())
+            .unwrap_or_default();
+        let list: Vec<String> = cpus.iter().map(|x| format!("CPU {}", x.cpu)).collect();
+        let title = if list.is_empty() {
+            "Incoming packets dropped: kernel receive backlog full".to_string()
+        } else {
+            format!(
+                "{} cannot keep up with incoming packets (backlog full)",
+                list.join(", ")
+            )
+        };
+        let mut f = Finding::new("net-backlog", Severity::Warning, title).fact(format!(
+            "Backlog drops in {} samples {} (avg {:.1}/s).",
+            c.count_positive("softnet_drops"),
+            c.window_desc(),
+            c.avg("softnet_drops").unwrap_or(0.0)
+        ));
+        for x in &cpus {
+            let busy =
+                c.s.cpu
+                    .as_ref()
+                    .and_then(|s| s.per_core.get(x.cpu))
+                    .copied();
+            f = f.fact(format!(
+                "CPU {}: {:.1} drops/s, budget exhausted {:.1}×/s{}.",
+                x.cpu,
+                x.dropped,
+                x.squeezed,
+                busy.map_or(String::new(), |b| format!(", CPU {} busy", fmt_pct(b)))
+            ));
+        }
+        for i in ifaces.iter().filter(|i| i.irq.is_some()) {
+            f = f.fact(irq_fact(&i.name, i.irq.expect("filtered"), c));
+        }
+        if cpus.len() == 1 && c.s.host.ncpu > 1 {
+            f = f.cause("All received packets are processed on a single CPU (one RX queue without RPS/RSS).");
+        }
+        out.push(
+            f.cause("Bursts exceed net.core.netdev_max_backlog.")
+                .cause("The CPU doing packet processing is saturated.")
+                .check("cat /proc/net/softnet_stat   # column 2 = drops per CPU (hex)")
+                .check("sysctl net.core.netdev_max_backlog net.core.netdev_budget")
+                .check("cat /sys/class/net/<iface>/queues/rx-*/rps_cpus   # RPS spreads processing over CPUs"),
+        );
+    }
+
+    // 4. UDP socket receive buffers.
+    if c.repeated("udp_buf_errors", MIN_DROP_SAMPLES) {
+        let socks: Vec<SocketDrops> = seen
+            .udp_sockets
+            .as_ref()
+            .filter(|(t, _)| *t >= since)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let title = match socks.first() {
+            Some(s) => format!(
+                "UDP socket {} {}drops datagrams: receive buffer full",
+                s.local,
+                s.owner.short().map_or(String::new(), |o| format!("({o}) "))
+            ),
+            None => "UDP datagrams dropped: socket receive buffers full".to_string(),
+        };
+        let mut f = Finding::new("udp-rcvbuf", Severity::Warning, title).fact(format!(
+            "UDP receive buffer overflows in {} samples {} (avg {:.1} datagrams/s).",
+            c.count_positive("udp_buf_errors"),
+            c.window_desc(),
+            c.avg("udp_buf_errors").unwrap_or(0.0)
+        ));
+        for s in &socks {
+            f = f.fact(format!(
+                "{} {} – {}: {}{} dropped since the socket was opened.",
+                s.proto,
+                s.local,
+                s.owner.describe(),
+                s.drops_per_s
+                    .map_or(String::new(), |r| format!("{r:.1}/s now, ")),
+                s.total
+            ));
+        }
+        if socks.is_empty() {
+            f = f.fact("No socket with drops was found in /proc/net/udp when it was scanned (it may have been closed).");
+        }
+        let port = socks
+            .first()
+            .and_then(|s| s.local.rsplit(':').next())
+            .unwrap_or("<port>")
+            .to_string();
+        out.push(
+            f.cause("The application reads from the socket more slowly than datagrams arrive (busy, blocked or single-threaded).")
+                .cause("The socket buffer is too small for traffic bursts (SO_RCVBUF, net.core.rmem_default / rmem_max).")
+                .check(format!("ss -uamp 'sport = :{port}'   # skmem d<N> = drops, rb = buffer size"))
+                .check("sysctl net.core.rmem_default net.core.rmem_max")
+                .check("top -H -p <pid>   # is the receiving thread at 100 % CPU?"),
+        );
+    }
+
+    // 5. Connection tracking.
+    if let Some(ct) = d.conntrack {
+        let pct = ct.used_pct().unwrap_or(0.0);
+        let dropping = c.count_positive("conntrack_drops") >= 1;
+        if dropping || pct >= CONNTRACK_WARN_PCT {
+            let (sev, title) = if dropping {
+                (
+                    Severity::Critical,
+                    "Connection tracking table full: packets are dropped",
+                )
+            } else {
+                (
+                    Severity::Warning,
+                    "Connection tracking table is almost full",
+                )
+            };
+            let mut f = Finding::new("conntrack", sev, title).fact(format!(
+                "{} of {} tracked connections ({}).",
+                ct.count,
+                ct.max,
+                fmt_pct(pct)
+            ));
+            if dropping {
+                f = f.fact(format!(
+                    "Dropped because the table was full: {:.1} packets/s on average {}{}.",
+                    c.avg("conntrack_drops").unwrap_or(0.0),
+                    c.window_desc(),
+                    ct.early_drop
+                        .map_or(String::new(), |e| format!("; early drops {e:.1}/s now"))
+                ));
+            }
+            out.push(
+                f.cause("Many connections through this host: NAT gateway, proxy, container host or a load spike.")
+                    .cause("Many short-lived or half-open connections (scans, floods) that stay in the table until they time out.")
+                    .cause("net.netfilter.nf_conntrack_max is too small for this workload.")
+                    .check("sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max")
+                    .check("conntrack -S   # per-CPU drop / insert_failed counters")
+                    .check("conntrack -L 2>/dev/null | awk '{print $5}' | sort | uniq -c | sort -n | tail   # busiest sources"),
+            );
+        }
+    }
+
+    // 6. TCP drops inside the stack.
+    if c.repeated("tcp_rcv_drops", MIN_DROP_SAMPLES) {
+        let mut f = Finding::new(
+            "tcp-rcv-drops",
+            Severity::Warning,
+            "TCP is discarding received data inside the kernel",
+        )
+        .fact(format!(
+            "Receive-side TCP drops in {} samples {} (avg {:.1}/s).",
+            c.count_positive("tcp_rcv_drops"),
+            c.window_desc(),
+            c.avg("tcp_rcv_drops").unwrap_or(0.0)
+        ));
+        if let Some(t) = d.tcp {
+            f = f.fact(format!(
+                "Now: pruned {:.1}/s, backlog {:.1}/s, receive queue {:.1}/s, out-of-order {:.1}/s, zero window {:.1}/s; memory pressure events {:.1}/s.",
+                t.pruned, t.backlog_drop, t.rcvq_drop, t.ofo_drop, t.zero_window_drop, t.mem_pressures
+            ));
+        }
+        out.push(
+            f.cause("TCP memory pressure: total socket buffer use reached net.ipv4.tcp_mem.")
+                .cause("Applications do not read their sockets, so receive queues fill up.")
+                .check("cat /proc/net/sockstat   # TCP mem (pages) vs the limits below")
+                .check("sysctl net.ipv4.tcp_mem net.ipv4.tcp_rmem")
+                .check("ss -tmp | sort -t, -k1 | less   # sockets with large rb / Recv-Q"),
+        );
+    }
+
+    // 7. Frames nothing on the host handles (usually harmless).
+    let nohandler: Vec<&&IfaceDiag> = ifaces.iter().filter(|i| i.rx_nohandler > 0.0).collect();
+    if !nohandler.is_empty() {
+        let names: Vec<String> = nohandler
+            .iter()
+            .map(|i| format!("{} ({:.1}/s)", i.name, i.rx_nohandler))
+            .collect();
+        out.push(
+            Finding::new("net-nohandler", Severity::Info, "Frames for unused protocols are discarded")
+                .fact(format!("Frames without a protocol handler: {}.", names.join(", ")))
+                .cause("Normal: LLDP/CDP, spanning tree, IPv6 on hosts without IPv6, or VLANs that are not configured here. Nothing is lost that this host would use.")
+                .check(format!("tcpdump -eni {} -c 20 'not ip and not ip6 and not arp'   # what the frames are (root)", nohandler[0].name)),
+        );
+    }
+
+    // 8. Interface drops the counters above do not explain.
+    if c.sustained(|r| r.net_drops.map(|v| v >= 1.0)) {
+        let unexplained: Vec<String> = ifaces
+            .iter()
+            .filter_map(|i| {
+                let rx = (i.rx_dropped - i.rx_nohandler).max(0.0);
+                (rx > 0.0 || i.tx_dropped > 0.0)
+                    .then(|| format!("{} (rx {:.1}/s, tx {:.1}/s)", i.name, rx, i.tx_dropped))
+            })
+            .collect();
+        let no_detail = ifaces.is_empty();
+        if !unexplained.is_empty() || (no_detail && nohandler.is_empty()) {
+            let mut f = Finding::new(
+                "net-drops",
+                Severity::Info,
+                "Packets are dropped for a reason the counters do not show",
+            )
+            .fact(format!(
+                "{:.1} dropped packets/s on average {}.",
+                c.avg("net_drops").unwrap_or(0.0),
+                c.window_desc()
+            ));
+            if !unexplained.is_empty() {
+                f = f.fact(format!("Interface drops: {}.", unexplained.join(", ")));
+            } else {
+                f = f.fact("Per-interface counters in /sys/class/net are not available, so the drops could not be classified.");
+            }
+            let mut ruled_out = vec!["damaged frames", "NIC overruns", "frames without a handler"];
+            if d.softnet_available {
+                ruled_out.push("receive backlog");
+            }
+            if d.udp.is_some() {
+                ruled_out.push("UDP buffers");
+            }
+            if d.conntrack.is_some() {
+                ruled_out.push("conntrack");
+            }
+            if !no_detail {
+                f = f.fact(format!("Ruled out by counters: {}.", ruled_out.join(", ")));
+            }
+            if let Some(ip) = d.ip
+                && ip.in_discards + ip.in_hdr_errors + ip.in_addr_errors > 0.0
+            {
+                f = f.fact(format!(
+                        "IP layer now: discards {:.1}/s, header errors {:.1}/s, address errors {:.1}/s.",
+                        ip.in_discards, ip.in_hdr_errors, ip.in_addr_errors
+                    ));
+            }
+            let n = ifaces.first().map_or("<iface>", |i| i.name.as_str());
+            out.push(
+                f.cause("Transmit drops: the queueing discipline is full because the link is saturated.")
+                    .cause("A backup member of a bond/team interface: it drops everything it receives by design.")
+                    .cause("Driver, XDP/eBPF or bridge/VLAN filtering drops.")
+                    .check(format!("tc -s qdisc show dev {n}   # 'dropped' = transmit queue drops"))
+                    .check(format!("ip -s -s link show {n}"))
+                    .check("cat /proc/net/bonding/*   # is this a backup slave?")
+                    .check("perf record -e skb:kfree_skb -a sleep 10 && perf report   # exact kernel drop location (root)"),
+            );
+        }
+    }
+
+    // Generic interface errors not already explained above.
+    if !explained_errors && c.sustained(|r| r.net_errors.map(|v| v > 0.0)) {
+        let list: Vec<String> =
             c.s.nets
                 .iter()
                 .filter(|n| n.rx_errs_per_s + n.tx_errs_per_s > 0.0)
@@ -642,94 +1054,176 @@ fn rule_network(c: &Ctx, out: &mut Vec<Finding>) {
                 c.avg("net_errors").unwrap_or(0.0)
             ),
         );
-        if !ifaces.is_empty() {
-            f = f.fact(format!("Currently: {}.", ifaces.join(", ")));
+        if !list.is_empty() {
+            f = f.fact(format!("Currently: {}.", list.join(", ")));
+        }
+        if ifaces.iter().any(|i| i.tx_errors > 0.0) {
+            f = f.fact("Transmit errors (carrier / aborted) are present: the link went down or the peer stopped answering.");
         }
         out.push(
-            f.cause("Faulty cable, connector or switch port (CRC/frame errors).")
+            f.cause("Faulty cable, connector or switch port.")
                 .cause("Duplex or speed mismatch with the switch.")
                 .cause("NIC driver or firmware problem.")
                 .check("ip -s link show <iface>")
-                .check("ethtool -S <iface> | grep -iE 'err|crc|fifo'")
-                .check("ethtool <iface>   # speed / duplex"),
-        );
-    }
-    if c.sustained(|r| r.net_drops.map(|v| v >= 1.0)) {
-        let ifaces: Vec<String> =
-            c.s.nets
-                .iter()
-                .filter(|n| n.rx_drop_per_s + n.tx_drop_per_s > 0.0)
-                .map(|n| {
-                    let pkts = n.rx_pps + n.tx_pps;
-                    let drops = n.rx_drop_per_s + n.tx_drop_per_s;
-                    let share = if pkts > 0.0 {
-                        format!(", {} of packets", fmt_pct(drops / (pkts + drops) * 100.0))
-                    } else {
-                        String::new()
-                    };
-                    format!("{} ({drops:.1}/s{share})", n.name)
-                })
-                .collect();
-        let mut f =
-            Finding::new("net-drops", Severity::Info, "Packets are being dropped").fact(format!(
-                "{:.1} dropped packets/s on average {}.",
-                c.avg("net_drops").unwrap_or(0.0),
-                c.window_desc()
-            ));
-        if !ifaces.is_empty() {
-            f = f.fact(format!("Currently: {}.", ifaces.join(", ")));
-        }
-        out.push(
-            f.cause(
-                "Frames for protocols or VLANs this host does not handle – common and harmless.",
-            )
-            .cause("Receive ring buffer overflow during traffic bursts.")
-            .cause("Traffic-control (qdisc) drops on transmit when the link is full.")
-            .check("ip -s -s link show <iface>")
-            .check("ethtool -g <iface>   # ring buffer sizes")
-            .check("tc -s qdisc show dev <iface>"),
+                .check("ethtool -S <iface> | grep -iE 'err|crc|fifo|carrier'")
+                .check("ethtool <iface>   # speed / duplex / link"),
         );
     }
 }
 
-fn rule_tcp(c: &Ctx, out: &mut Vec<Finding>) {
+fn irq_fact(name: &str, q: IrqShare, c: &Ctx) -> String {
+    let busy =
+        c.s.cpu
+            .as_ref()
+            .and_then(|s| s.per_core.get(q.top_cpu))
+            .map_or(String::new(), |b| {
+                format!("; CPU {} is {} busy", q.top_cpu, fmt_pct(*b))
+            });
+    if q.cpus_used <= 1 {
+        format!(
+            "{name}: {} of its interrupts ({}/s) are handled by CPU {}{busy}.",
+            fmt_pct(q.top_share),
+            fmt_count(q.per_s),
+            q.top_cpu
+        )
+    } else {
+        format!(
+            "{name}: interrupts ({}/s) are spread over {} CPUs (largest share CPU {}: {}).",
+            fmt_count(q.per_s),
+            q.cpus_used,
+            q.top_cpu,
+            fmt_pct(q.top_share)
+        )
+    }
+}
+
+fn rule_tcp(c: &Ctx, seen: &NetSeen, out: &mut Vec<Finding>) {
     let Some(t) = &c.s.tcp else { return };
+    let drops = c.count_positive("tcp_listen_drops");
     if c.sustained(|r| {
         Some(r.tcp_retrans_pct? >= RETRANS_PCT && r.tcp_retrans? >= RETRANS_MIN_PER_S)
     }) {
-        out.push(
-            Finding::new(
-                "tcp-retrans",
-                Severity::Warning,
-                "High TCP retransmission rate",
+        let retr = t.retrans_per_s;
+        let syn = c.s.net_diag.tcp.map_or(0.0, |d| d.syn_retrans);
+        let syn_share = if retr > 0.0 {
+            (syn / retr * 100.0).min(100.0)
+        } else {
+            0.0
+        };
+        let mostly_syn = syn_share >= 50.0;
+        let own_listen_full = mostly_syn && drops >= 2;
+        let peers: Vec<RetransPeer> = seen
+            .retrans_peers
+            .as_ref()
+            .filter(|(at, _)| *at >= c.now - c.secs)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let (sev, title) = if own_listen_full {
+            (
+                Severity::Info,
+                "TCP retransmissions are mostly connection retries to a full listen queue"
+                    .to_string(),
             )
+        } else if mostly_syn {
+            (
+                Severity::Warning,
+                "TCP connection attempts are not being answered (SYN retransmissions)".to_string(),
+            )
+        } else if let Some(p) = peers.first() {
+            (
+                Severity::Warning,
+                format!("High TCP retransmission rate, mostly with {}", p.remote),
+            )
+        } else {
+            (
+                Severity::Warning,
+                "High TCP retransmission rate".to_string(),
+            )
+        };
+        let mut f = Finding::new("tcp-retrans", sev, title)
             .fact(format!(
                 "{} of sent segments were retransmissions on average {} ({:.0}/s).",
                 fmt_pct(c.avg("tcp_retrans_pct").unwrap_or(0.0)),
                 c.window_desc(),
                 c.avg("tcp_retrans").unwrap_or(0.0)
             ))
-            .fact(format!("{} established connections.", t.established))
-            .cause("Packet loss on the path: congestion, a faulty link, Wi-Fi interference.")
-            .cause("Overloaded or slow peers that do not acknowledge in time.")
-            .cause("A single bulk transfer over a lossy long-distance link.")
-            .check("ss -ti state established | grep -B1 retrans   # which connections")
-            .check("nstat -az TcpRetransSegs TcpExtTCPTimeouts TcpExtTCPLostRetransmit")
-            .check("mtr -rwc 50 <peer>   # active test: sends traffic"),
+            .fact(format!(
+                "Now {:.0}/s retransmitted, of which {:.0}/s ({}) are SYN/SYN-ACK (connection setup); {} established connections.",
+                retr,
+                syn,
+                fmt_pct(syn_share),
+                t.established
+            ));
+        for p in &peers {
+            f = f.fact(format!(
+                "{} ↔ {}: {} connection(s) retransmitting{} – {}.",
+                p.local,
+                p.remote,
+                p.sockets,
+                if p.connecting > 0 {
+                    format!(", {} still connecting", p.connecting)
+                } else {
+                    String::new()
+                },
+                p.owner.describe()
+            ));
+        }
+        if own_listen_full {
+            f = f.cause("Clients keep retrying connections to this host's own full listen queue (see the listen-drop finding); fixing that removes these retransmissions.");
+        }
+        if mostly_syn {
+            f = f
+                .cause("The peer does not answer connection attempts: service down, its listen queue full, or a firewall silently dropping SYNs.")
+                .cause("The peer is unreachable (routing, wrong address).");
+        } else {
+            f = f
+                .cause("Packet loss on the path: congestion, a faulty link, Wi-Fi interference.")
+                .cause("Overloaded or slow peers that do not acknowledge in time.")
+                .cause("A single bulk transfer over a lossy long-distance link.");
+        }
+        let peer = peers.first().map_or("<peer>".to_string(), |p| {
+            p.remote
+                .rsplit_once(':')
+                .map_or(p.remote.clone(), |(h, _)| {
+                    h.trim_matches(|ch| ch == '[' || ch == ']').to_string()
+                })
+        });
+        out.push(
+            f.check(format!("ss -tin dst {peer}   # retrans:N/M per connection"))
+                .check("nstat -az TcpRetransSegs TcpExtTCPSynRetrans TcpExtTCPTimeouts TcpExtTCPLostRetransmit")
+                .check(format!("mtr -rwc 50 {peer}   # active test: sends traffic")),
         );
     }
-    let drops =
-        c.w.since(c.now - c.secs)
-            .filter(|r| r.tcp_listen_drops.is_some_and(|v| v > 0.0))
-            .count();
     if drops >= 2 {
+        let listeners: Vec<ListenQueue> = seen
+            .listeners
+            .as_ref()
+            .filter(|(t, _)| *t >= c.now - c.secs)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        let title = match listeners.first() {
+            Some(l) => format!(
+                "Incoming TCP connections dropped at {}{}",
+                l.local,
+                l.owner.short().map_or(String::new(), |o| format!(" ({o})"))
+            ),
+            None => "Incoming TCP connections are being dropped".to_string(),
+        };
+        let mut f = Finding::new("tcp-listen-drops", Severity::Warning, title).fact(format!(
+            "Listen queue drops in {drops} samples {}; now {:.1}/s.",
+            c.window_desc(),
+            t.listen_drops_per_s.unwrap_or(0.0)
+        ));
+        for l in &listeners {
+            f = f.fact(format!(
+                "{} – {}: {} connection(s) waiting to be accepted.",
+                l.local,
+                l.owner.describe(),
+                l.queued
+            ));
+        }
         out.push(
-            Finding::new("tcp-listen-drops", Severity::Warning, "Incoming TCP connections are being dropped")
-                .fact(format!(
-                    "Listen queue drops in {drops} samples {}; now {:.1}/s.",
-                    c.window_desc(),
-                    t.listen_drops_per_s.unwrap_or(0.0)
-                ))
+            f
                 .cause("A server application accepts connections slower than they arrive (accept queue full).")
                 .cause("The listen backlog is too small for bursts (net.core.somaxconn, application backlog).")
                 .cause("A SYN flood.")
@@ -1124,6 +1618,215 @@ mod tests {
         let f = Engine::new(30).evaluate(&s, &w);
         assert_eq!(ids(&f), vec!["swap-idle"]);
         assert_eq!(f[0].severity, Severity::Info);
+    }
+
+    fn net_snapshot(now: i64) -> Snapshot {
+        let mut s = snapshot(now);
+        s.nets_available = true;
+        s.net_diag.softnet_available = true;
+        s.net_diag.udp = Some(UdpDiag::default());
+        s.net_diag.conntrack = None;
+        s
+    }
+
+    #[test]
+    fn udp_drops_name_the_socket_and_process() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| r.udp_buf_errors = Some(40.0));
+        let mut s = net_snapshot(now);
+        s.net_diag.udp = Some(UdpDiag {
+            rcvbuf_errors: 40.0,
+            ..Default::default()
+        });
+        s.net_diag.udp_sockets = vec![SocketDrops {
+            proto: "udp",
+            local: "0.0.0.0:514".into(),
+            drops_per_s: Some(40.0),
+            total: 1204,
+            owner: SockOwner {
+                process: Some(Owner {
+                    pid: 812,
+                    comm: "rsyslogd".into(),
+                }),
+                user: Some("syslog".into()),
+                hidden: false,
+            },
+        }];
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(ids(&f), vec!["udp-rcvbuf"]);
+        assert!(f[0].title.contains("0.0.0.0:514") && f[0].title.contains("rsyslogd"));
+        assert!(
+            f[0].facts
+                .iter()
+                .any(|x| x.contains("pid 812") && x.contains("1204"))
+        );
+        assert!(f[0].checks.iter().any(|x| x.contains("sport = :514")));
+    }
+
+    #[test]
+    fn hidden_owner_still_names_the_user() {
+        let o = SockOwner {
+            process: None,
+            user: Some("svc".into()),
+            hidden: true,
+        };
+        assert_eq!(
+            o.describe(),
+            "a process of user svc (not visible without root)"
+        );
+        assert_eq!(o.short().as_deref(), Some("user svc"));
+    }
+
+    #[test]
+    fn syn_retries_to_own_full_queue_are_not_a_second_warning() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| {
+            r.tcp_retrans_pct = Some(100.0);
+            r.tcp_retrans = Some(200.0);
+            r.tcp_listen_drops = Some(200.0);
+        });
+        let mut s = net_snapshot(now);
+        s.tcp = Some(TcpStats {
+            retrans_per_s: 200.0,
+            out_segs_per_s: 200.0,
+            ..Default::default()
+        });
+        s.net_diag.tcp = Some(TcpDropDiag {
+            syn_retrans: 190.0,
+            ..Default::default()
+        });
+        let f = Engine::new(30).evaluate(&s, &w);
+        let retr = f.iter().find(|x| x.id == "tcp-retrans").unwrap();
+        assert_eq!(retr.severity, Severity::Info);
+        assert!(retr.title.contains("full listen queue"));
+        assert_eq!(f[0].id, "tcp-listen-drops");
+    }
+
+    #[test]
+    fn short_drop_burst_is_ignored() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| {
+            r.udp_buf_errors = Some(if r.t >= now - 2 { 50.0 } else { 0.0 })
+        });
+        assert!(Engine::new(30).evaluate(&net_snapshot(now), &w).is_empty());
+    }
+
+    #[test]
+    fn frames_without_handler_are_only_informational() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| r.net_drops = Some(3.0));
+        let mut s = net_snapshot(now);
+        s.net_diag.ifaces = vec![IfaceDiag {
+            name: "eth0".into(),
+            rx_dropped: 3.0,
+            rx_nohandler: 3.0,
+            ..Default::default()
+        }];
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(ids(&f), vec!["net-nohandler"]);
+        assert_eq!(f[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn unexplained_drops_say_what_was_ruled_out() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| r.net_drops = Some(5.0));
+        let mut s = net_snapshot(now);
+        s.net_diag.ifaces = vec![IfaceDiag {
+            name: "bond0".into(),
+            rx_dropped: 5.0,
+            ..Default::default()
+        }];
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(ids(&f), vec!["net-drops"]);
+        assert!(
+            f[0].facts
+                .iter()
+                .any(|x| x.starts_with("Ruled out by counters"))
+        );
+    }
+
+    #[test]
+    fn nic_overruns_point_at_single_cpu_interrupts() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| r.nic_rx_overruns = Some(12.0));
+        let mut s = net_snapshot(now);
+        s.cpu = Some(CpuStats {
+            per_core: vec![99.0, 3.0, 2.0, 1.0],
+            ..Default::default()
+        });
+        s.net_diag.ifaces = vec![IfaceDiag {
+            name: "eth0".into(),
+            rx_overrun: 12.0,
+            irq: Some(IrqShare {
+                top_cpu: 0,
+                top_share: 99.5,
+                cpus_used: 1,
+                per_s: 25_000.0,
+            }),
+            ..Default::default()
+        }];
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(ids(&f), vec!["net-overrun"]);
+        assert!(f[0].title.starts_with("eth0"));
+        assert!(
+            f[0].facts
+                .iter()
+                .any(|x| x.contains("handled by CPU 0") && x.contains("99%"))
+        );
+        assert!(f[0].causes[0].contains("one CPU"));
+    }
+
+    #[test]
+    fn full_conntrack_table_is_critical() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| {
+            r.conntrack_drops = Some(if r.t == now { 7.0 } else { 0.0 })
+        });
+        let mut s = net_snapshot(now);
+        s.net_diag.conntrack = Some(ConntrackDiag {
+            count: 65_536,
+            max: 65_536,
+            drop: Some(7.0),
+            ..Default::default()
+        });
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(ids(&f), vec!["conntrack"]);
+        assert_eq!(f[0].severity, Severity::Critical);
+        // Almost full but not dropping: a warning.
+        let w = window_with(now, 60, |r| r.conntrack_drops = Some(0.0));
+        s.net_diag.conntrack = Some(ConntrackDiag {
+            count: 950,
+            max: 1000,
+            drop: Some(0.0),
+            ..Default::default()
+        });
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(f[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn listen_drops_name_the_listener() {
+        let now = 10_000;
+        let w = window_with(now, 60, |r| r.tcp_listen_drops = Some(4.0));
+        let mut s = net_snapshot(now);
+        s.tcp = Some(TcpStats::default());
+        s.net_diag.listeners = vec![ListenQueue {
+            local: "[::]:8080".into(),
+            queued: 129,
+            owner: SockOwner {
+                process: Some(Owner {
+                    pid: 2211,
+                    comm: "java".into(),
+                }),
+                user: Some("app".into()),
+                hidden: false,
+            },
+        }];
+        let f = Engine::new(30).evaluate(&s, &w);
+        assert_eq!(ids(&f), vec!["tcp-listen-drops"]);
+        assert!(f[0].title.contains("[::]:8080") && f[0].title.contains("java"));
+        assert!(f[0].facts.iter().any(|x| x.contains("129 connection")));
     }
 
     #[test]

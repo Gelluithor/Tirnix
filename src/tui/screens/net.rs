@@ -13,13 +13,26 @@ use crate::util::*;
 pub fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let wide = area.width >= 110;
     let tcp_h = if wide { 0 } else { 12 };
-    let spark_h = if area.height >= 28 { 5 } else { 0 };
-    let [top, tcp_area, sparks] = Layout::vertical([
+    let drops = drop_lines(app);
+    let drops_h = if drops.is_empty() {
+        0
+    } else {
+        (drops.len() as u16 + 2).min(area.height / 3)
+    };
+    let spark_h = if area.height >= 28 + drops_h { 5 } else { 0 };
+    let [top, tcp_area, drop_area, sparks] = Layout::vertical([
         Constraint::Min(4),
         Constraint::Length(tcp_h),
+        Constraint::Length(drops_h),
         Constraint::Length(spark_h),
     ])
     .areas(area);
+    if drops_h > 0 {
+        f.render_widget(
+            Paragraph::new(drops).block(block("Drop analysis — details on Diagnostics (6)")),
+            drop_area,
+        );
+    }
     let (if_area, tcp_area) = if wide {
         let [a, b] = Layout::horizontal([Constraint::Min(60), Constraint::Length(44)]).areas(top);
         (a, b)
@@ -238,4 +251,108 @@ fn draw_tcp(f: &mut Frame, area: Rect, app: &App) {
         lines.push(super::collecting());
     }
     f.render_widget(Paragraph::new(lines).block(block("TCP")), area);
+}
+
+/// Where packets are being lost right now, if anywhere.
+fn drop_lines(app: &App) -> Vec<Line<'static>> {
+    let d = &app.snap.net_diag;
+    let warn = level(75.0);
+    let mut out = Vec::new();
+    for i in &d.ifaces {
+        let total = i.rx_dropped
+            + i.tx_dropped
+            + i.rx_corrupt
+            + i.rx_overrun
+            + i.rx_nohandler
+            + i.tx_errors;
+        if total <= 0.0 {
+            continue;
+        }
+        let mut parts = Vec::new();
+        for (label, v) in [
+            ("rx dropped", i.rx_dropped),
+            ("no handler", i.rx_nohandler),
+            ("NIC overruns", i.rx_overrun),
+            ("damaged frames", i.rx_corrupt),
+            ("tx dropped", i.tx_dropped),
+            ("tx errors", i.tx_errors),
+        ] {
+            if v > 0.0 {
+                parts.push(format!("{label} {v:.1}/s"));
+            }
+        }
+        out.push(Line::from(vec![
+            Span::styled(format!("{:<10}", i.name), bold()),
+            Span::styled(parts.join(", "), warn),
+        ]));
+    }
+    for c in d.softnet.iter().filter(|c| c.dropped > 0.0) {
+        out.push(Line::from(vec![
+            Span::styled(format!("{:<10}", format!("CPU {}", c.cpu)), bold()),
+            Span::styled(
+                format!("receive backlog full: {:.1} drops/s", c.dropped),
+                warn,
+            ),
+        ]));
+    }
+    if d.udp.is_some_and(|u| u.rcvbuf_errors > 0.0) {
+        for s in &d.udp_sockets {
+            out.push(Line::from(vec![
+                Span::styled(format!("{:<10}", s.proto.to_uppercase()), bold()),
+                Span::styled(
+                    format!(
+                        "{} buffer full{} – {}",
+                        s.local,
+                        s.drops_per_s
+                            .map_or(String::new(), |r| format!(", {r:.0} drops/s")),
+                        s.owner.describe()
+                    ),
+                    warn,
+                ),
+            ]));
+        }
+    }
+    if app
+        .snap
+        .tcp
+        .as_ref()
+        .and_then(|t| t.listen_drops_per_s)
+        .is_some_and(|r| r > 0.0)
+    {
+        for l in &d.listeners {
+            out.push(Line::from(vec![
+                Span::styled(format!("{:<10}", "LISTEN"), bold()),
+                Span::styled(
+                    format!(
+                        "{} accept queue {} – {}",
+                        l.local,
+                        l.queued,
+                        l.owner.describe()
+                    ),
+                    warn,
+                ),
+            ]));
+        }
+    }
+    if let Some(ct) = d.conntrack {
+        let pct = ct.used_pct().unwrap_or(0.0);
+        if pct >= 80.0 || ct.drop.is_some_and(|x| x > 0.0) {
+            out.push(Line::from(vec![
+                Span::styled(format!("{:<10}", "conntrack"), bold()),
+                Span::styled(
+                    format!(
+                        "{}/{} entries ({}){}",
+                        ct.count,
+                        ct.max,
+                        fmt_pct(pct),
+                        ct.drop
+                            .filter(|x| *x > 0.0)
+                            .map_or(String::new(), |x| format!(", {x:.1} drops/s"))
+                    ),
+                    warn,
+                ),
+            ]));
+        }
+    }
+    out
 }

@@ -23,6 +23,7 @@ src/
 │   ├── mod.rs         Collector: owns previous counters, turns them into a Snapshot
 │   ├── procfs.rs      Pure parsers for /proc text formats (unit tested)
 │   ├── fs.rs          Mount table filtering + statvfs
+│   ├── netdiag.rs     Network drop analysis: classify drops, find sockets/processes
 │   └── process.rs     /proc/<pid> scanning, per-process CPU / RSS / I/O
 ├── metrics.rs         Data model: Snapshot (live) and Record (compact, storable)
 ├── window.rs          In-memory ring buffer of Records + statistics helpers
@@ -74,6 +75,10 @@ in the screens that show it.
 * The list of block devices and network interfaces (from `/sys`) is cached
   and refreshed once a minute.
 * The logger does not scan processes at all.
+* "Escalation": detailed sources are read only while cheap counters show a
+  problem. Network drop analysis reads socket tables, `/proc/<pid>/fd` and
+  `/proc/interrupts` only while drops occur, at most every 5 s, and caches
+  socket owners for a minute.
 
 ## Diagnostics
 

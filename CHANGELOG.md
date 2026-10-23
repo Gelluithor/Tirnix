@@ -6,6 +6,26 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Network drop analysis that finds *where* packets are lost and *who* is
+  affected: damaged frames, NIC receive ring overflows (with the CPUs that
+  handle the interrupts), kernel receive backlog per CPU, UDP sockets with
+  full receive buffers (socket, process, user), full TCP accept queues
+  (listener, process, queue length), a full connection tracking table and
+  TCP memory-pressure drops. Unexplained drops list what was ruled out.
+- TCP retransmissions are attributed to peers and processes; SYN
+  retransmissions are recognised as unanswered connection attempts and
+  linked to this host's own full listen queue when that is the cause.
+- "Drop analysis" panel on the Network screen while drops occur.
+- New stored metrics: NIC overruns, damaged frames, backlog drops, UDP
+  buffer drops, conntrack usage and drops, TCP receive-side drops.
+
+### Changed
+
+- Socket owners that are not visible without root are reported with their
+  user instead of being omitted.
+
 ## [0.1.0] - 2026-10-23
 
 The first release of Tirnix: a lightweight terminal UI that monitors a Linux

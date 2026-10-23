@@ -323,6 +323,10 @@ pub struct NetRaw {
     pub rx_packets: u64,
     pub rx_errs: u64,
     pub rx_drop: u64,
+    /// Receive FIFO (ring buffer) overruns.
+    pub rx_fifo: u64,
+    /// Length, overrun, CRC and frame-alignment errors combined.
+    pub rx_frame: u64,
     pub tx_bytes: u64,
     pub tx_packets: u64,
     pub tx_errs: u64,
@@ -348,6 +352,8 @@ pub fn parse_net_dev(text: &str) -> Vec<NetRaw> {
             rx_packets: f[1],
             rx_errs: f[2],
             rx_drop: f[3],
+            rx_fifo: f[4],
+            rx_frame: f[5],
             tx_bytes: f[8],
             tx_packets: f[9],
             tx_errs: f[10],

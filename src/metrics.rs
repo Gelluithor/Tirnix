@@ -177,6 +177,210 @@ pub struct ProcSummary {
     pub io_denied: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Network drop analysis
+// ---------------------------------------------------------------------------
+//
+// Filled by `collect::netdiag`. Cheap counters are read on every sample; the
+// expensive parts (socket tables, process ownership, interrupt distribution)
+// only while the cheap counters show drops. All rates are per second.
+
+/// Process that owns a socket.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Owner {
+    pub pid: u32,
+    pub comm: String,
+}
+
+/// Who holds a socket. The user is known from the socket table even when
+/// the process is not visible (another user's process without root).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SockOwner {
+    pub process: Option<Owner>,
+    pub user: Option<String>,
+    /// The process could not be identified because of permissions.
+    pub hidden: bool,
+}
+
+impl SockOwner {
+    pub fn describe(&self) -> String {
+        let user = self.user.as_deref();
+        match (&self.process, user) {
+            (Some(p), Some(u)) => format!("{} (pid {}, user {u})", p.comm, p.pid),
+            (Some(p), None) => format!("{} (pid {})", p.comm, p.pid),
+            (None, Some(u)) if self.hidden => {
+                format!("a process of user {u} (not visible without root)")
+            }
+            (None, _) if self.hidden => "a process not visible without root".into(),
+            (None, Some(u)) => format!("user {u}; process not found (socket may be closed)"),
+            (None, None) => "owner not found (socket may be closed)".into(),
+        }
+    }
+
+    /// Short form for titles: process name, else user.
+    pub fn short(&self) -> Option<String> {
+        self.process
+            .as_ref()
+            .map(|p| p.comm.clone())
+            .or_else(|| self.user.as_ref().map(|u| format!("user {u}")))
+    }
+}
+
+/// A remote peer with TCP connections that currently retransmit.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RetransPeer {
+    pub remote: String,
+    /// Local address of the first such connection (shows the service).
+    pub local: String,
+    pub sockets: usize,
+    /// Connections still in SYN-SENT (connection attempts not answered).
+    pub connecting: usize,
+    pub owner: SockOwner,
+}
+
+/// Interrupt distribution of one network interface.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IrqShare {
+    /// CPU that handled most of the interface's interrupts.
+    pub top_cpu: usize,
+    /// Share of the interrupts handled by `top_cpu` (%).
+    pub top_share: f64,
+    /// CPUs that handled at least 5 % of the interrupts.
+    pub cpus_used: usize,
+    pub per_s: f64,
+}
+
+/// Classified drop and error rates of one interface, from
+/// `/sys/class/net/<iface>/statistics`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IfaceDiag {
+    pub name: String,
+    pub rx_dropped: f64,
+    pub tx_dropped: f64,
+    /// CRC, frame-alignment and length errors: damaged frames.
+    pub rx_corrupt: f64,
+    /// Missed, over and FIFO errors: the NIC ran out of receive buffers.
+    pub rx_overrun: f64,
+    /// Frames for protocols nothing on this host handles.
+    pub rx_nohandler: f64,
+    /// Carrier, aborted and FIFO transmit errors.
+    pub tx_errors: f64,
+    pub irq: Option<IrqShare>,
+}
+
+/// Per-CPU drops of the kernel's receive backlog (`/proc/net/softnet_stat`).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SoftnetCpu {
+    pub cpu: usize,
+    /// Packets dropped because the backlog queue was full.
+    pub dropped: f64,
+    /// Times packet processing ran out of budget with work left.
+    pub squeezed: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct UdpDiag {
+    /// Datagrams dropped because a socket's receive buffer was full.
+    pub rcvbuf_errors: f64,
+    pub sndbuf_errors: f64,
+    pub in_errors: f64,
+    /// Datagrams to ports nobody listens on.
+    pub no_ports: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TcpDropDiag {
+    pub backlog_drop: f64,
+    pub rcvq_drop: f64,
+    pub zero_window_drop: f64,
+    /// Data discarded from receive queues under memory pressure.
+    pub pruned: f64,
+    pub ofo_drop: f64,
+    pub mem_pressures: f64,
+    pub reqq_full_drop: f64,
+    /// Retransmitted SYN and SYN-ACK segments (connection setup).
+    pub syn_retrans: f64,
+}
+
+impl TcpDropDiag {
+    /// Received data dropped inside the TCP stack.
+    pub fn receive_drops(&self) -> f64 {
+        self.backlog_drop + self.rcvq_drop + self.pruned + self.ofo_drop + self.zero_window_drop
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct IpDiag {
+    pub in_discards: f64,
+    pub in_hdr_errors: f64,
+    pub in_addr_errors: f64,
+    pub reasm_fails: f64,
+    pub out_discards: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ConntrackDiag {
+    pub count: u64,
+    pub max: u64,
+    /// Packets dropped because the table was full (needs the stat file).
+    pub drop: Option<f64>,
+    pub early_drop: Option<f64>,
+    pub insert_failed: Option<f64>,
+}
+
+impl ConntrackDiag {
+    pub fn used_pct(&self) -> Option<f64> {
+        util::pct(self.count as f64, self.max as f64)
+    }
+}
+
+/// A UDP socket whose receive buffer overflowed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SocketDrops {
+    pub proto: &'static str,
+    pub local: String,
+    /// Drops per second since the previous scan, if there was one.
+    pub drops_per_s: Option<f64>,
+    /// Drops since the socket was created.
+    pub total: u64,
+    pub owner: SockOwner,
+}
+
+/// A listening TCP socket with connections waiting to be accepted.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListenQueue {
+    pub local: String,
+    pub queued: u64,
+    pub owner: SockOwner,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetDiag {
+    /// Interfaces that recently had drops or errors.
+    pub ifaces: Vec<IfaceDiag>,
+    pub softnet_available: bool,
+    /// CPUs with backlog drops or squeezes in this interval.
+    pub softnet: Vec<SoftnetCpu>,
+    pub udp: Option<UdpDiag>,
+    pub tcp: Option<TcpDropDiag>,
+    pub ip: Option<IpDiag>,
+    pub conntrack: Option<ConntrackDiag>,
+    /// UDP sockets that dropped datagrams (scanned only during drops).
+    pub udp_sockets: Vec<SocketDrops>,
+    /// Listening sockets with a non-empty accept queue (scanned only
+    /// during listen drops).
+    pub listeners: Vec<ListenQueue>,
+    /// Peers of retransmitting TCP connections (scanned only while the
+    /// retransmission ratio is high).
+    pub retrans_peers: Vec<RetransPeer>,
+}
+
+impl NetDiag {
+    pub fn softnet_drops(&self) -> f64 {
+        self.softnet.iter().map(|c| c.dropped).sum()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
     /// Unix time of the sample.
@@ -201,6 +405,7 @@ pub struct Snapshot {
     pub procs: Option<ProcSummary>,
     /// (allocated, max) file handles system-wide.
     pub file_handles: Option<(u64, u64)>,
+    pub net_diag: NetDiag,
 }
 
 impl Snapshot {
@@ -437,11 +642,18 @@ record_fields! {
     net_tx: Network, BytesPerSec, "Network TX";
     net_errors: Network, PerSec, "Network errors";
     net_drops: Network, PerSec, "Network drops";
+    nic_rx_overruns: Network, PerSec, "NIC receive overruns";
+    nic_rx_corrupt: Network, PerSec, "Corrupted frames received";
+    softnet_drops: Network, PerSec, "Receive backlog drops";
+    udp_buf_errors: Network, PerSec, "UDP receive buffer drops";
+    conntrack_pct: Network, Percent, "Conntrack table usage";
+    conntrack_drops: Network, PerSec, "Conntrack drops";
     tcp_estab: Tcp, Count, "TCP established";
     tcp_time_wait: Tcp, Count, "TCP TIME_WAIT";
     tcp_retrans: Tcp, PerSec, "TCP retransmits";
     tcp_retrans_pct: Tcp, Percent, "TCP retransmit ratio";
     tcp_listen_drops: Tcp, PerSec, "TCP listen drops";
+    tcp_rcv_drops: Tcp, PerSec, "TCP receive-side drops";
     fs_used_max: Filesystem, Percent, "Fullest filesystem";
     fs_inodes_max: Filesystem, Percent, "Highest inode usage";
     psi_cpu: Pressure, Percent, "CPU pressure (some, 10s)";
@@ -493,6 +705,21 @@ impl Record {
             r.net_errors = r2(errs);
             r.net_drops = r2(drops);
         }
+        let nd = &s.net_diag;
+        if s.interval.is_some() && s.nets_available {
+            let sum = |f: fn(&IfaceDiag) -> f64| r2(nd.ifaces.iter().map(f).sum());
+            r.nic_rx_overruns = sum(|i| i.rx_overrun);
+            r.nic_rx_corrupt = sum(|i| i.rx_corrupt);
+        }
+        if nd.softnet_available && s.interval.is_some() {
+            r.softnet_drops = r2(nd.softnet_drops());
+        }
+        r.udp_buf_errors = nd.udp.map(|u| util::round2(u.rcvbuf_errors));
+        if let Some(ct) = nd.conntrack {
+            r.conntrack_pct = ct.used_pct().map(util::round2);
+            r.conntrack_drops = ct.drop.map(util::round2);
+        }
+        r.tcp_rcv_drops = nd.tcp.map(|t| util::round2(t.receive_drops()));
         if let Some(t) = &s.tcp {
             r.tcp_estab = Some(t.established as f64);
             r.tcp_time_wait = t.sockets.tcp_tw.map(|v| v as f64);
