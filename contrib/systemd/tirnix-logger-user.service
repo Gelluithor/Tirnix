@@ -1,0 +1,36 @@
+# Optional per-user Tirnix logger (no root required).
+#
+# Not enabled by installation. To use it:
+#   1. Enable logging in the config: `tirnix` → Settings, or set
+#      `[logging] enabled = true` in ~/.config/tirnix/config.toml
+#      (do not also start it from the TUI; only one logger runs per data directory)
+#   2. mkdir -p ~/.config/systemd/user
+#      cp tirnix-logger-user.service ~/.config/systemd/user/tirnix-logger.service
+#      (packages install it as /usr/lib/systemd/user/tirnix-logger.service)
+#   3. systemctl --user daemon-reload
+#      systemctl --user enable --now tirnix-logger.service
+#   4. Optional, to keep it running while you are logged out:
+#      sudo loginctl enable-linger "$USER"
+# Stop and disable:  systemctl --user disable --now tirnix-logger.service
+#
+# ExecStart expects tirnix on PATH of the user manager; adjust the path if you
+# installed it elsewhere (the install script uses ~/.local/bin).
+
+[Unit]
+Description=Tirnix metrics logger (user)
+Documentation=https://github.com/Gelluithor/Tirnix
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env tirnix logger run
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=78
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=default.target

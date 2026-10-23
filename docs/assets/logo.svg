@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="200" viewBox="0 0 660 200" role="img" aria-label="Tirnix — Linux monitoring and diagnostics">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151a2d"/>
+      <stop offset="1" stop-color="#0b0e18"/>
+    </linearGradient>
+    <linearGradient id="pulse" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.55" stop-color="#4ade80"/>
+      <stop offset="1" stop-color="#facc15"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#e2e8f0"/>
+      <stop offset="1" stop-color="#94a3b8"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-50%" width="140%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Card -->
+  <rect x="2" y="2" width="656" height="196" rx="28" fill="url(#bg)" stroke="#2a3150" stroke-width="2"/>
+
+  <!-- Icon: terminal window with a pulse trace -->
+  <g transform="translate(36 34)">
+    <rect width="132" height="132" rx="24" fill="#0f1424" stroke="#334066" stroke-width="2"/>
+    <circle cx="22" cy="20" r="5" fill="#f87171"/>
+    <circle cx="38" cy="20" r="5" fill="#facc15"/>
+    <circle cx="54" cy="20" r="5" fill="#4ade80"/>
+    <line x1="12" y1="34" x2="120" y2="34" stroke="#26304d" stroke-width="2"/>
+    <!-- bar meters -->
+    <rect x="18" y="104" width="14" height="14" rx="3" fill="#22d3ee" opacity="0.55"/>
+    <rect x="38" y="96" width="14" height="22" rx="3" fill="#22d3ee" opacity="0.7"/>
+    <rect x="58" y="88" width="14" height="30" rx="3" fill="#4ade80" opacity="0.8"/>
+    <rect x="78" y="100" width="14" height="18" rx="3" fill="#4ade80" opacity="0.7"/>
+    <rect x="98" y="80" width="14" height="38" rx="3" fill="#facc15" opacity="0.85"/>
+    <!-- pulse -->
+    <polyline points="14,66 36,66 46,48 58,84 70,56 80,66 118,66"
+              fill="none" stroke="url(#pulse)" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)"/>
+  </g>
+
+  <!-- Wordmark -->
+  <text x="200" y="112" font-family="'JetBrains Mono','SFMono-Regular','Menlo','Consolas','DejaVu Sans Mono',monospace"
+        font-size="76" font-weight="800" letter-spacing="2" fill="url(#word)">tirnix</text>
+  <rect x="494" y="58" width="10" height="60" rx="2" fill="#4ade80">
+    <animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="1.2s" repeatCount="indefinite"/>
+  </rect>
+  <text x="203" y="152" font-family="'JetBrains Mono','SFMono-Regular','Menlo','Consolas','DejaVu Sans Mono',monospace"
+        font-size="19" fill="#7c89a8" letter-spacing="0.3">Linux monitoring &amp; diagnostics TUI</text>
+</svg>

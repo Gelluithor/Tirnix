@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
+  static:
+    name: static build + smoke test (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Smoke test on a real Linux runner
+        env:
+          BIN: target/${{ matrix.target }}/release/tirnix
+        run: |
+          set -eux
+          ldd "$BIN" 2>&1 | grep -q "not a dynamic executable\|statically linked"
+          "$BIN" --version
+          "$BIN" report --seconds 2
+          # Logger lifecycle with an isolated config and data directory.
+          export TIRNIX_CONFIG="$RUNNER_TEMP/tirnix/config.toml"
+          export XDG_STATE_HOME="$RUNNER_TEMP/state"
+          "$BIN" logger run && exit 1 || test $? -eq 78   # disabled by default
+          "$BIN" logger start
+          sleep 12
+          "$BIN" logger status | grep "running (pid"
+          "$BIN" export --since 1h --format csv | head -3
+          "$BIN" logger stop
+          "$BIN" logger status | grep "not running"

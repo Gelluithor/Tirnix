@@ -1,0 +1,22 @@
+# Example configuration for the system-wide logger service
+# (contrib/systemd/tirnix-logger.service). Install as /etc/tirnix/config.toml.
+
+[ui]
+refresh_ms = 2000
+
+[collection]
+include_network_fs = false
+
+[logging]
+# The service refuses to run unless this is true.
+enabled = true
+interval_secs = 10
+# Matches StateDirectory=tirnix in the unit file.
+directory = "/var/lib/tirnix"
+retention_days = 14
+max_size_mb = 200
+metrics = ["cpu", "memory", "disk", "network", "tcp", "filesystem", "pressure"]
+
+[active_checks]
+targets = []
+timeout_ms = 2000

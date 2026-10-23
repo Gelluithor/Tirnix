@@ -1,0 +1,79 @@
+name: Release
+
+# Push a tag like v0.1.0 to build static binaries, .deb and .rpm packages,
+# SHA256SUMS, and publish them as a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Check that the tag matches Cargo.toml
+        run: |
+          v="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          test "v$v" = "$GITHUB_REF_NAME"
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: target/${{ matrix.target }}/release/tirnix report --seconds 1
+      - name: Archive
+        run: |
+          set -eux
+          name="tirnix-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/tirnix" install.sh uninstall.sh README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          cp -r contrib "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -r "dist/$name"
+      - name: Packages (.deb, .rpm)
+        run: |
+          set -eux
+          cargo install --locked cargo-deb cargo-generate-rpm
+          cargo deb --no-build --target ${{ matrix.target }} --output dist/
+          cargo generate-rpm --target ${{ matrix.target }} --output dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" '/^## \[/{p = index($0, "[" v "]") > 0; next} p' CHANGELOG.md > notes.md
+          test -s notes.md || echo "Release $GITHUB_REF_NAME" > notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "Tirnix $GITHUB_REF_NAME" --notes-file notes.md

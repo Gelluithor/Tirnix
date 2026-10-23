@@ -1,0 +1,66 @@
+# Optional system-wide Tirnix logger.
+#
+# This unit is NOT enabled by installing Tirnix. To use it:
+#   1. sudo install -Dm644 /usr/share/doc/tirnix/examples/config.toml /etc/tirnix/config.toml
+#      (or write your own; it must contain `[logging] enabled = true`)
+#   2. sudo systemctl daemon-reload
+#   3. sudo systemctl enable --now tirnix-logger.service
+# Stop and disable:   sudo systemctl disable --now tirnix-logger.service
+# Data is stored in /var/lib/tirnix (remove it to delete the history).
+#
+# If tirnix is installed in /usr/local/bin, override ExecStart with
+#   sudo systemctl edit tirnix-logger.service
+
+[Unit]
+Description=Tirnix metrics logger
+Documentation=https://github.com/Gelluithor/Tirnix
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tirnix logger run --config /etc/tirnix/config.toml
+Restart=on-failure
+RestartSec=30
+# 78 = logging disabled in the config: do not restart in a loop.
+RestartPreventExitStatus=78
+
+# Run as an unprivileged, transient user; data goes to /var/lib/tirnix.
+DynamicUser=yes
+StateDirectory=tirnix
+StateDirectoryMode=0750
+UMask=0027
+
+# Low priority and bounded resources.
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=64M
+TasksMax=8
+
+# Sandboxing. The logger only reads /proc, /sys and statvfs() and writes to
+# its state directory. It never opens network sockets.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

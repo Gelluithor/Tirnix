@@ -1,0 +1,59 @@
+[package]
+name = "tirnix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Lightweight Linux system monitoring and diagnostics TUI"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Gelluithor/Tirnix"
+readme = "README.md"
+keywords = ["monitoring", "tui", "linux", "sysadmin", "diagnostics"]
+categories = ["command-line-utilities"]
+exclude = ["/.github", "/dist"]
+
+[dependencies]
+libc = "0.2"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# `cargo deb` (https://github.com/kornelski/cargo-deb)
+[package.metadata.deb]
+maintainer = "Tirnix contributors"
+section = "admin"
+priority = "optional"
+extended-description = """\
+Tirnix is an interactive terminal UI for monitoring and diagnosing Linux \
+systems: CPU, memory, disks, processes, network and TCP, with diagnostics \
+that explain anomalies and suggest how to verify them. Optional long-term \
+logging is disabled by default; no service is enabled on installation."""
+assets = [
+    ["target/release/tirnix", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/tirnix/", "644"],
+    ["CHANGELOG.md", "usr/share/doc/tirnix/", "644"],
+    ["contrib/systemd/tirnix-logger.service", "usr/lib/systemd/system/", "644"],
+    ["contrib/systemd/tirnix-logger-user.service", "usr/lib/systemd/user/tirnix-logger.service", "644"],
+    ["contrib/config/system-config.toml", "usr/share/doc/tirnix/examples/config.toml", "644"],
+]
+# Unit files are shipped as plain files: the package never enables or
+# starts a service (no maintainer scripts).
+
+# `cargo generate-rpm` (https://github.com/cat-in-136/cargo-generate-rpm)
+[package.metadata.generate-rpm]
+summary = "Lightweight Linux system monitoring and diagnostics TUI"
+assets = [
+    { source = "target/release/tirnix", dest = "/usr/bin/tirnix", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/tirnix/README.md", mode = "644", doc = true },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/tirnix/CHANGELOG.md", mode = "644", doc = true },
+    { source = "contrib/systemd/tirnix-logger.service", dest = "/usr/lib/systemd/system/tirnix-logger.service", mode = "644" },
+    { source = "contrib/systemd/tirnix-logger-user.service", dest = "/usr/lib/systemd/user/tirnix-logger.service", mode = "644" },
+    { source = "contrib/config/system-config.toml", dest = "/usr/share/doc/tirnix/examples/config.toml", mode = "644", doc = true },
+]
