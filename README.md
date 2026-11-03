@@ -4,7 +4,8 @@
 
 <p align="center">
   <b>A lightweight terminal UI for monitoring and diagnosing Linux systems.</b><br>
-  It shows what is happening, explains what it likely means, and tells you how to check.
+  It shows what is happening, explains what it likely means, and tells you how to check.<br>
+  <a href="https://gelluithor.github.io/tirnix/">gelluithor.github.io/tirnix</a>
 </p>
 
 <p align="center">
